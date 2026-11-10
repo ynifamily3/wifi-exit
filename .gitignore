@@ -1,0 +1,5 @@
+build/
+docs/
+legacy/
+.DS_Store
+*.zip
