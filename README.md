@@ -132,3 +132,7 @@ wifi-exit install        # engine.swift 가 바뀌었을 때 root 쪽 갱신 (su
 - pf 앵커는 주소마다 한 줄로 쓰고 `pfctl -o none`으로 올린다. 기본 최적화는 같은 줄이 여섯 개쯤 넘으면 `<__automatic_…>` 표로 묶는다. 그러면 규칙 하나에 주소가 여럿 들어가 주소별 카운터가 사라진다. 상태 판독은 표가 생겨도 표 내용을 읽어 맞춘다.
 - `wifi-exit diag`는 진단을 위해 앵커를 기본 옵션으로 한 번 다시 올린다. 다음 적용 때 엔진이 원래대로 되돌린다.
 - 개발용: `defaults write com.miel.WifiExit routesDebugLog -bool true` 이면 라우팅 보기 창이 받은 사건(칸 이름 포함)을 `~/Library/Caches/wifi-exit-routes.jsonl` 에 남긴다. 끝나면 `defaults delete com.miel.WifiExit routesDebugLog`.
+
+## 라이선스
+
+[MIT](LICENSE)
