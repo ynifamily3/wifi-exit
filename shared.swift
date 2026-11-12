@@ -70,6 +70,16 @@ enum CheckTarget {
 enum Exits {
     static let elseActions = ["block", "system", "next"]
 
+    /// Does a VPN exit's portal (an alias from VPN Bar's tunnels.json, or a portal host such as
+    /// cloudvpn.nexon.co.kr from the older single-tunnel file) belong to `alias`? Exact, not a prefix:
+    /// "cloud" must not match a pass tunnel just because a stale file says cloudvpn.
+    static func vpnMatches(portal: String, alias: String) -> Bool {
+        guard !portal.isEmpty, !alias.isEmpty else { return false }
+        if portal == alias { return true }
+        let first = portal.split(separator: ".").first.map(String.init) ?? portal
+        return portal.contains(".") && (first == alias || first == alias + "vpn")
+    }
+
     static func isValid(_ e: String) -> Bool {
         if ["wifi", "wired", "tether", "vpn:any"].contains(e) { return true }
         guard e.hasPrefix("vpn:") else { return false }

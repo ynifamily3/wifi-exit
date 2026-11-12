@@ -208,10 +208,57 @@ func readNet() -> NetSnapshot {
         } else { byIf[e.iface] = e }
     }
     exits = Array(byIf.values)
-    // 정렬: wifi, wired, tether, vpn 순
+    // VPN Bar 다중 연결: tunnels.json 에 터널마다 별칭·DNS 가 있다. 대기 터널은 네트워크 서비스가 없어서
+    // 여기서만 보인다. 파일이 오래됐거나(30초) 쓴 프로세스가 죽었으면 무시하고 위의 서비스만 쓴다.
+    var vpnRank: [String: Int] = [:]
+    if let tj = readJSON(gpTunnelsPath, GPTunnels.self), now() - tj.updatedAt <= 30,
+       kill(tj.writerPid, 0) == 0 || errno == EPERM {
+        for (i, t) in tj.tunnels.enumerated() where t.iface.hasPrefix("utun") && Target.ipv4Number(t.ip) != nil {
+            let dns = t.dns.filter { Target.ipv4Number($0) != nil }
+            // 1순위(기본 경로)를 맨 앞에: 조건의 vpn= 과 vpn:any 가 그 터널을 먼저 본다.
+            vpnRank[t.iface] = t.alias == tj.primary ? -1 : i
+            if let j = exits.firstIndex(where: { $0.iface == t.iface }) {
+                exits[j].name = "vpn"; exits[j].portal = t.alias
+                if !dns.isEmpty { exits[j].dns = dns }
+            } else {
+                let has = (ifaddrsIPv4()[t.iface] ?? []).contains(t.ip)
+                exits.append(ExitInfo(name: "vpn", iface: t.iface, ip: t.ip, gateway: "", dns: dns, portal: t.alias, up: has))
+            }
+        }
+    }
+    // 정렬: wifi, wired, tether, vpn 순 (VPN 끼리는 VPN Bar 순위)
     let order = ["wifi": 0, "wired": 1, "tether": 2, "vpn": 3]
-    exits.sort { (order[$0.name] ?? 9, $0.iface) < (order[$1.name] ?? 9, $1.iface) }
+    exits.sort { (order[$0.name] ?? 9, vpnRank[$0.iface] ?? 99, $0.iface) < (order[$1.name] ?? 9, vpnRank[$1.iface] ?? 99, $1.iface) }
     return NetSnapshot(exits: exits, masks: masks, wifi: wifi)
+}
+
+/// VPN Bar 가 쓰는 공개 계약 (/var/run/gpvpn/tunnels.json, 다중 연결 모드).
+let gpTunnelsPath = "/var/run/gpvpn/tunnels.json"
+struct GPTunnels: Decodable {
+    struct Tunnel: Decodable { let alias: String; let portal: String; let iface: String; let ip: String; let dns: [String] }
+    let updatedAt: Int
+    let writerPid: Int32
+    let primary: String?
+    let tunnels: [Tunnel]
+}
+
+/// 인터페이스 → IPv4 주소들 (getifaddrs).
+func ifaddrsIPv4() -> [String: [String]] {
+    var out: [String: [String]] = [:]
+    var head: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&head) == 0, let first = head else { return out }
+    defer { freeifaddrs(head) }
+    var p: UnsafeMutablePointer<ifaddrs>? = first
+    while let cur = p {
+        if let sa = cur.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                out[String(cString: cur.pointee.ifa_name), default: []].append(String(cString: host))
+            }
+        }
+        p = cur.pointee.ifa_next
+    }
+    return out
 }
 
 func routeGet(_ dest: String) -> [String: String] {
@@ -654,7 +701,9 @@ func apply(forceResolve: Bool = false) -> EngineStatus {
         switch dec {
         case .route(_, let e):
             guard let server = e.dns.first else { for d in ds where domainExit[d] == nil { domainExit[d] = .some(nil) }; continue }
-            if !net.onSubnet(server, of: e), !dnsPins.contains(where: { $0.dest == server }) {
+            // VPN 출구는 고정하지 않는다: dig -b <터널 주소> 가 그 터널의 scoped 기본 경로를 탄다. 여러 터널이
+            // 같은 DNS(8.8.8.8 등)를 쓰거나 그 주소가 시스템 DNS 여도 전역 경로를 건드리지 않는다.
+            if e.name != "vpn", !net.onSubnet(server, of: e), !dnsPins.contains(where: { $0.dest == server }) {
                 let pin = RouteSpec("host", server, gateway: e.gateway, iface: e.iface)
                 routeSet(pin, table: table)        // 해석 전에 DNS 서버 경로부터
                 table = routeTable()

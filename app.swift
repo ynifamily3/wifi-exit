@@ -210,7 +210,7 @@ func exitCandidates() -> [String] {
     if let text = try? String(contentsOfFile: path, encoding: .utf8) {
         for line in text.split(separator: "\n") where !line.hasPrefix("#") {
             let kv = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-            guard kv.count == 2, !["default", "dns"].contains(kv[0]), !kv[0].contains("."), Exits.isValid("vpn:" + kv[0]) else { continue }
+            guard kv.count == 2, !["default", "dns", "login"].contains(kv[0]), !kv[0].contains("."), Exits.isValid("vpn:" + kv[0]) else { continue }
             aliases.append("vpn:" + kv[0])
         }
     }

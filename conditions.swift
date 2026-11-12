@@ -275,7 +275,7 @@ struct Facts {
             switch v {
             case "none": return (vpn == nil, now)
             case "any": return (vpn != nil, now)
-            default: return (vpn.map { !$0.portal.isEmpty && ($0.portal == v || $0.portal.hasPrefix(v)) } ?? false, now)
+            default: return (vpn.map { Exits.vpnMatches(portal: $0.portal, alias: v) } ?? false, now)
             }
         case "link":
             return (linkUp(v), up.map(\.name).filter { $0 != "vpn" }.joined(separator: ",").ifEmpty("없음"))
@@ -342,7 +342,7 @@ func matchingExits(_ name: String, in exits: [ExitInfo]) -> [ExitInfo] {
     default:
         guard name.hasPrefix("vpn:") else { return [] }
         let alias = String(name.dropFirst(4))
-        return up.filter { $0.name == "vpn" && !$0.portal.isEmpty && ($0.portal == alias || $0.portal.hasPrefix(alias)) }
+        return up.filter { $0.name == "vpn" && Exits.vpnMatches(portal: $0.portal, alias: alias) }
     }
 }
 
