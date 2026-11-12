@@ -396,3 +396,16 @@ func readStatus() -> EngineStatus? {
     guard let d = FileManager.default.contents(atPath: Paths.status) else { return nil }
     return try? JSONDecoder().decode(EngineStatus.self, from: d)
 }
+
+// MARK: - 자식 프로세스
+
+extension Process {
+    /// run() 하고 끝남을 기다릴 신호를 돌려준다. waitUntilExit() 는 런루프를 돌며 기다려서
+    /// 자식이 끝난 뒤에도 60ms 남짓 늦게 돌아온다 (apply 한 번에 명령 20개면 1초 넘게 버린다).
+    func runWatched() throws -> DispatchSemaphore {
+        let done = DispatchSemaphore(value: 0)
+        terminationHandler = { _ in done.signal() }
+        try run()
+        return done
+    }
+}

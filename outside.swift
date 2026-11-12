@@ -116,9 +116,10 @@ func shRun(_ path: String, _ args: [String]) -> String {
     p.arguments = args
     let o = Pipe()
     p.standardOutput = o; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
-    do { try p.run() } catch { return "" }
+    let done: DispatchSemaphore
+    do { done = try p.runWatched() } catch { return "" }
     let d = o.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
+    done.wait()
     return String(decoding: d, as: UTF8.self)
 }
 

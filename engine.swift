@@ -44,12 +44,13 @@ func run(_ path: String, _ args: [String]) -> Out {
     p.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
     let o = Pipe(), e = Pipe()
     p.standardOutput = o; p.standardError = e; p.standardInput = FileHandle.nullDevice
-    do { try p.run() } catch { return Out(code: -1, out: "", err: "\(error)") }
+    let done: DispatchSemaphore
+    do { done = try p.runWatched() } catch { return Out(code: -1, out: "", err: "\(error)") }
     var errData = Data()
     let g = DispatchGroup(); g.enter()
     DispatchQueue.global().async { errData = e.fileHandleForReading.readDataToEndOfFile(); g.leave() }
     let outData = o.fileHandleForReading.readDataToEndOfFile()
-    g.wait(); p.waitUntilExit()
+    g.wait(); done.wait()
     return Out(code: p.terminationStatus, out: String(decoding: outData, as: UTF8.self), err: String(decoding: errData, as: UTF8.self))
 }
 
@@ -1249,9 +1250,15 @@ func cmdInstall() {
         try? FileManager.default.removeItem(atPath: Paths.legacyHelper)
     }
     run("/bin/launchctl", ["bootout", "system/\(Paths.daemonLabel)"])
+    // bootout 은 옛 데몬이 다 내려가기 전에 돌아온다. 그새 bootstrap 하면 "5: Input/output error" 가 난다.
+    for _ in 0..<50 where run("/bin/launchctl", ["print", "system/\(Paths.daemonLabel)"]).ok { usleep(100_000) }
     writeAtomic(plist(Paths.engine).data(using: .utf8)!, Paths.daemonPlist)
     chown(Paths.daemonPlist, 0, 0)
-    let r = run("/bin/launchctl", ["bootstrap", "system", Paths.daemonPlist])
+    var r = run("/bin/launchctl", ["bootstrap", "system", Paths.daemonPlist])
+    for _ in 0..<5 where !r.ok {
+        usleep(500_000)
+        r = run("/bin/launchctl", ["bootstrap", "system", Paths.daemonPlist])
+    }
     if !r.ok { die("데몬을 올리지 못했어요: \(r.err)") }
     log("installed engine (daemon)")
     withLock { _ = apply(forceResolve: true) }

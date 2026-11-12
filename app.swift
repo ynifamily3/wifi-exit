@@ -33,14 +33,15 @@ func sh(_ path: String, _ args: [String]) -> ShellResult {
     p.standardOutput = o
     p.standardError = e
     p.standardInput = FileHandle.nullDevice
-    do { try p.run() } catch { return ShellResult(code: -1, out: "", err: "\(error)") }
+    let done: DispatchSemaphore
+    do { done = try p.runWatched() } catch { return ShellResult(code: -1, out: "", err: "\(error)") }
     var errData = Data()
     let g = DispatchGroup()
     g.enter()
     DispatchQueue.global().async { errData = e.fileHandleForReading.readDataToEndOfFile(); g.leave() }
     let outData = o.fileHandleForReading.readDataToEndOfFile()
     g.wait()
-    p.waitUntilExit()
+    done.wait()
     return ShellResult(code: p.terminationStatus,
                        out: String(decoding: outData, as: UTF8.self),
                        err: String(decoding: errData, as: UTF8.self))
