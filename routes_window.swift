@@ -911,6 +911,7 @@ struct RoutesWindow: View {
     /// 가운데 층 (상태가 바뀔 때만): 칸과 글자. 매 프레임 글자를 다시 그리지 않아 CPU 를 아낀다
     private func drawNodes(_ ctx: inout GraphicsContext, size: CGSize) {
         let L = layout(size)
+        let fit = TextFit.fit
         let scene = stream.scene
         func label(_ s: String, _ p: CGPoint, _ c: Color, _ font: Font, anchor: UnitPoint = .center) {
             ctx.draw(Text(s).font(font).foregroundColor(c), at: p, anchor: anchor)
@@ -929,27 +930,42 @@ struct RoutesWindow: View {
             c.fill(Path(roundedRect: rect, cornerRadius: 7), with: .color(stage))
             c.stroke(Path(roundedRect: rect, cornerRadius: 7), with: .color(focusRule == key ? fg : muted.opacity(0.7)), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
             c.draw(Text("규칙 없음").font(.system(size: 9, weight: .medium)).foregroundColor(muted.opacity(0.8)), at: CGPoint(x: rect.minX + 8, y: p.y), anchor: .leading)
-            c.draw(Text(String(key.dropFirst())).font(.system(size: h < 26 ? 11 : 12, weight: .semibold, design: .monospaced)).foregroundColor(fg.opacity(0.85)),
+            let n = scene.count("r:\(key)")
+            let room = w - 56 - (n > 0 ? 26 : 8)
+            let fs: CGFloat = h < 26 ? 11 : 12
+            c.draw(Text(fit(String(key.dropFirst()), fs, .semibold, true, room, .middle)).font(.system(size: fs, weight: .semibold, design: .monospaced)).foregroundColor(fg.opacity(0.85)),
                    at: CGPoint(x: rect.minX + 56, y: p.y - (h >= 30 ? 6 : 0)), anchor: .leading)
             if h >= 30, let latest = scene.groupLatest[key], latest != String(key.dropFirst()) {
-                c.draw(Text(latest).font(.system(size: 9.5, design: .monospaced)).foregroundColor(muted),
+                c.draw(Text(fit(latest, 9.5, .regular, true, room, .middle)).font(.system(size: 9.5, design: .monospaced)).foregroundColor(muted),
                        at: CGPoint(x: rect.minX + 56, y: p.y + 8), anchor: .leading)
             }
-            let n = scene.count("r:\(key)")
             if n > 0 { c.draw(Text("\(n)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.maxX - 8, y: p.y), anchor: .trailing) }
         }
 
-        // 길 양 끝의 포트: 앱 쪽은 출발 포트(여럿이면 개수), 출구 쪽은 목적지 포트
+        // 길 양 끝의 포트: 앱 쪽은 출발 포트(여럿이면 개수), 출구 쪽은 목적지 포트.
+        // 한 앱에서 여러 규칙으로, 여러 규칙에서 한 출구로 길이 갈라지면 끝점이 같으므로 끝점마다 모아 한 번만 쓴다.
+        var appEnds: [String: (p: CGPoint, flows: [RouteScene.Flow])] = [:]
+        var exitEnds: [String: (p: CGPoint, flows: [RouteScene.Flow])] = [:]
         for (_, fs) in scene.bundles {
             let live = fs.filter { $0.closedAt == nil }
             guard let f0 = live.first, let pts = bundlePoints(app: f0.app, slot: f0.slot, iface: f0.iface, L) else { continue }
             if dimmed(rule: f0.slot, iface: f0.iface) { continue }
-            let left = live.count == 1 ? ":\(f0.ev.sport)" : "\(live.count)개 연결"
-            let dports = Array(Set(live.map(\.ev.dport))).sorted().prefix(3).map { ":\($0)" }.joined(separator: " ")
-            let font = Font.system(size: 9.5, weight: .medium, design: .monospaced)
-            ctx.draw(Text(left).font(font).foregroundColor(muted), at: CGPoint(x: pts.0.x + 6, y: pts.0.y - 8), anchor: .leading)
-            ctx.draw(Text(dports + " " + f0.ev.proto).font(font).foregroundColor(exitColor(exits.first { $0.iface == f0.iface }).opacity(0.85)),
-                     at: CGPoint(x: pts.3.x - 6, y: pts.3.y - 9), anchor: .trailing)
+            appEnds[f0.app, default: (pts.0, [])].flows += live
+            exitEnds[f0.iface, default: (pts.3, [])].flows += live
+        }
+        let portFont = Font.system(size: 9.5, weight: .medium, design: .monospaced)
+        for (_, end) in appEnds {
+            let sports = Set(end.flows.map(\.ev.sport))
+            let left = sports.count == 1 ? ":\(sports.first!)" : "\(end.flows.count)개 연결"
+            ctx.draw(Text(left).font(portFont).foregroundColor(muted), at: CGPoint(x: end.p.x + 6, y: end.p.y - 8), anchor: .leading)
+        }
+        for (iface, end) in exitEnds {
+            let ds = Array(Set(end.flows.map(\.ev.dport))).sorted()
+            var text = ds.prefix(3).map { ":\($0)" }.joined(separator: " ") + (ds.count > 3 ? " +\(ds.count - 3)" : "")
+            let protos = Set(end.flows.map(\.ev.proto)).sorted()
+            text += " " + protos.joined(separator: "/")
+            ctx.draw(Text(text).font(portFont).foregroundColor(exitColor(exits.first { $0.iface == iface }).opacity(0.85)),
+                     at: CGPoint(x: end.p.x - 6, y: end.p.y - 9), anchor: .trailing)
         }
 
         // 앱 칸
@@ -960,9 +976,9 @@ struct RoutesWindow: View {
             ctx.stroke(Path(roundedRect: rect, cornerRadius: 7), with: .color(lineC), lineWidth: 1)
             if let icon = scene.icons[a] {
                 ctx.draw(Image(nsImage: icon), in: CGRect(x: rect.minX + 6, y: p.y - 9, width: 18, height: 18))
-                label(a, CGPoint(x: rect.minX + 30, y: p.y), fg, .system(size: 12, weight: .medium), anchor: .leading)
+                label(fit(a, 12, .medium, false, rect.width - 30 - 8, .tail), CGPoint(x: rect.minX + 30, y: p.y), fg, .system(size: 12, weight: .medium), anchor: .leading)
             } else {
-                label(a, p, fg, .system(size: 12, weight: .medium))
+                label(fit(a, 12, .medium, false, rect.width - 16, .tail), p, fg, .system(size: 12, weight: .medium))
             }
         }
         if visibleApps.isEmpty {
@@ -982,12 +998,14 @@ struct RoutesWindow: View {
             c.stroke(Path(roundedRect: rect, cornerRadius: 7), with: .color(focusRule == r.id ? col : lineC), lineWidth: focusRule == r.id ? 1.6 : 1)
             let pos = (m.status?.rules.firstIndex { $0.id == r.id } ?? i) + 1
             c.draw(Text("#\(pos)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.minX + 8, y: p.y), anchor: .leading)
-            c.draw(Text(r.title).font(.system(size: h < 26 ? 11 : 12, weight: .semibold)).foregroundColor(fg), at: CGPoint(x: rect.minX + 34, y: p.y - (h >= 30 ? 6 : 0)), anchor: .leading)
+            let n = scene.count("r:\(r.id)")
+            let room = w - 34 - (n > 0 ? 26 : 8)
+            let fs: CGFloat = h < 26 ? 11 : 12
+            c.draw(Text(fit(r.title, fs, .semibold, false, room, .tail)).font(.system(size: fs, weight: .semibold)).foregroundColor(fg), at: CGPoint(x: rect.minX + 34, y: p.y - (h >= 30 ? 6 : 0)), anchor: .leading)
             if h >= 30 {
-                c.draw(Text(r.targets.map(\.target).joined(separator: ", ")).font(.system(size: 9.5, design: .monospaced)).foregroundColor(muted),
+                c.draw(Text(fit(r.targets.map(\.target).joined(separator: ", "), 9.5, .regular, true, room, .tail)).font(.system(size: 9.5, design: .monospaced)).foregroundColor(muted),
                        at: CGPoint(x: rect.minX + 34, y: p.y + 8), anchor: .leading)
             }
-            let n = scene.count("r:\(r.id)")
             if n > 0 { c.draw(Text("\(n)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.maxX - 8, y: p.y), anchor: .trailing) }
             if r.decision == "skip" || r.decision == "system" || r.decision == "next" {
                 c.draw(Text("적용 안 함").font(.system(size: 9)).foregroundColor(muted), at: CGPoint(x: rect.maxX + 6, y: p.y), anchor: .leading)
@@ -1006,8 +1024,9 @@ struct RoutesWindow: View {
             c.fill(Path(roundedRect: rect, cornerRadius: 8), with: .color(e.up ? col.opacity(0.12) : stage))
             c.stroke(Path(roundedRect: rect, cornerRadius: 8), with: .color(down ? Color.orange : col.opacity(e.up ? 0.9 : 0.5)),
                      style: StrokeStyle(lineWidth: 1.2, dash: e.up ? [] : [4, 4]))
-            c.draw(Text(e.label).font(.system(size: 12.5, weight: .semibold)).foregroundColor(e.up ? col : muted), at: CGPoint(x: rect.minX + 10, y: p.y - 7), anchor: .leading)
-            c.draw(Text(e.up ? (down ? "\(e.iface) · 응답 없음" : e.iface) : "\(e.iface) · 연결 안 됨").font(.system(size: 10, design: .monospaced)).foregroundColor(down ? .orange : muted),
+            let eroom = w - 10 - 26
+            c.draw(Text(fit(e.label, 12.5, .semibold, false, eroom, .tail)).font(.system(size: 12.5, weight: .semibold)).foregroundColor(e.up ? col : muted), at: CGPoint(x: rect.minX + 10, y: p.y - 7), anchor: .leading)
+            c.draw(Text(fit(e.up ? (down ? "\(e.iface) · 응답 없음" : e.iface) : "\(e.iface) · 연결 안 됨", 10, .regular, true, w - 18, .tail)).font(.system(size: 10, design: .monospaced)).foregroundColor(down ? .orange : muted),
                    at: CGPoint(x: rect.minX + 10, y: p.y + 9), anchor: .leading)
             let n = scene.count("x:\(e.iface)")
             if n > 0 { c.draw(Text("\(n)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.maxX - 8, y: p.y - 7), anchor: .trailing) }
@@ -1312,5 +1331,41 @@ struct RoutesWindow: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(timeString(e.t)) \(RouteScene.appLabel(e)) \(hostName(e)):\(e.dport) \(ruleText(e)) \(resultText(e))")
+    }
+}
+
+
+/// 캔버스 글자를 너비에 맞게 줄인다 (줄임표). 매 프레임 그리므로 결과를 기억해 둔다.
+@MainActor
+enum TextFit {
+    enum Mode { case tail, middle }
+    private static var cache: [String: String] = [:]
+
+    static func fit(_ s: String, _ size: CGFloat, _ weight: NSFont.Weight, _ mono: Bool, _ maxW: CGFloat, _ mode: Mode) -> String {
+        let key = "\(s)|\(size)|\(weight.rawValue)|\(mono)|\(Int(maxW))|\(mode)"
+        if let hit = cache[key] { return hit }
+        let font = mono ? NSFont.monospacedSystemFont(ofSize: size, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight)
+        func width(_ t: String) -> CGFloat { (t as NSString).size(withAttributes: [.font: font]).width }
+        var out = s
+        if maxW > 8, width(s) > maxW {
+            let chars = Array(s)
+            var lo = 0, hi = chars.count               // 남길 글자 수를 이분 탐색
+            func make(_ k: Int) -> String {
+                switch mode {
+                case .tail: return String(chars.prefix(k)) + "…"
+                case .middle:
+                    let head = (k + 1) / 2, tail = k / 2
+                    return String(chars.prefix(head)) + "…" + String(chars.suffix(tail))
+                }
+            }
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2
+                if width(make(mid)) <= maxW { lo = mid } else { hi = mid - 1 }
+            }
+            out = make(lo)
+        }
+        if cache.count > 2000 { cache.removeAll() }
+        cache[key] = out
+        return out
     }
 }
