@@ -2,34 +2,36 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleIdentifier</key>
-	<string>com.miel.WifiExit</string>
-	<key>CFBundleName</key>
-	<string>Wi-Fi Exit</string>
 	<key>CFBundleDisplayName</key>
 	<string>Wi-Fi Exit</string>
 	<key>CFBundleExecutable</key>
 	<string>WifiExit</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.miel.WifiExit</string>
+	<key>CFBundleName</key>
+	<string>Wi-Fi Exit</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
-	<key>CFBundleVersion</key>
-	<string>1</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>15.2</string>
-	<key>LSUIElement</key>
-	<true/>
+	<string>0.2</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
 			<string>com.miel.WifiExit</string>
 			<key>CFBundleURLSchemes</key>
-			<array><string>wifi-exit</string></array>
+			<array>
+				<string>wifi-exit</string>
+			</array>
 		</dict>
 	</array>
+	<key>CFBundleVersion</key>
+	<string>2</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.2</string>
+	<key>LSUIElement</key>
+	<true/>
 </dict>
 </plist>
