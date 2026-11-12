@@ -63,6 +63,7 @@ macOS 15.2 이상, Apple Silicon.
 | `shared.swift` | 경로, 설정(v2), 상태 모델, 대상 검사 |
 | `conditions.swift` | 조건 모델·파서·판단, 출구 결정, 조건 빌더 모델, 가려진 규칙 검사 (엔진과 앱이 함께 씀) |
 | `rules_window.swift` | 규칙 편집 창 |
+| `exit_reasons.swift` | 출구가 "지금 없음"일 때 까닭 (네트워크 설정의 서비스 + 인터페이스 상태). 앱·CLI 쪽만 쓰므로 엔진 갱신이 필요 없다 |
 | `routes_window.swift` | 라우팅 보기 창. 연결이 열리면 앱 → 규칙 → 출구로 길이 그려지고(출발 포트·목적 포트 표시), 패킷이 오갈 때마다 그 길로 캡슐이 움직인다(나감 = 출구 색 캡슐, 들어옴 = 작은 점; 많으면 표본으로 줄이되 한 번이라도 오가면 최소 1개). 닫히면 길이 흐려진다. 최근 10분 타임라인·되감기. 앱·규칙·출구 칸을 두 번 누르거나 "보기" 메뉴로 그것만 집중해서 보기 |
 | `outside.swift` | 라우팅 보기의 "전체" 범위: 연결 표를 1초마다 훑어 규칙 밖 연결의 열림·오감(받은/보낸 바이트 증가, 패킷 수는 1200바이트당 1개로 어림)·닫힘을 찾고, 역방향 조회로 이름을 붙임. 규칙 밖 연결은 목적지 등록 도메인(없으면 IP)마다 칸을 따로 두고(최대 8개), 칸을 눌러 "이 목적지로 규칙 만들기" |
 | `events.swift` | 연결 사건 흐름: `watch` 중에만 pf 기록을 켜고, pflog 를 해석해 열림·막힘을, `pfctl -vss` 계수기를 0.5초마다 읽어 오감(패킷·바이트 차이)·닫힘을 `/var/run/wifi-exit/events.sock` 으로 보냄. 한 연결의 사건은 열림 → 오감 → 닫힘 순서를 지킨다 (엔진에 들어감) |
@@ -88,7 +89,7 @@ macOS 15.2 이상, Apple Silicon.
 
 ```
 wifi-exit status [--json]      # 새는 대상이 있거나 엔진이 2분 넘게 멈춰 있으면 종료 코드 1
-wifi-exit exits                # 지금 쓸 수 있는 출구
+wifi-exit exits                # 지금 쓸 수 있는 출구, 없는 출구는 까닭(어댑터 안 보임·케이블 없음·주소 없음 …)
 wifi-exit add <IP|IP/nn|도메인> [--via wired,wifi] [--else block|system|next] [메모]
 wifi-exit set <대상|id> [--via …] [--else …] [--name 메모]
 wifi-exit move <대상|id> up|down|top|bottom|<위치>

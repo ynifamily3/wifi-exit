@@ -21,7 +21,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 cp Info.plist "$APP/Contents/Info.plist"
 cp icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-swiftc -O -swift-version 5 -parse-as-library app.swift rules_window.swift routes_window.swift outside.swift shared.swift conditions.swift -o "$APP/Contents/MacOS/WifiExit"
+swiftc -O -swift-version 5 -parse-as-library app.swift rules_window.swift routes_window.swift outside.swift exit_reasons.swift shared.swift conditions.swift -o "$APP/Contents/MacOS/WifiExit"
 swiftc -O -swift-version 5 -parse-as-library engine.swift events.swift shared.swift conditions.swift -o "$APP/Contents/Helpers/wifi-exitd"
 # 안쪽부터 서명한다. 타임스탬프 서버가 가끔 응답하지 않아 몇 번 다시 시도한다.
 sign() { for i in 1 2 3; do codesign --force --options runtime --timestamp --sign "$IDENTITY" "$@" && return 0; sleep 3; done; return 1; }

@@ -327,6 +327,7 @@ struct RuleForm: View {
                             ExitChip(name: e, label: Exits.label(e), active: m.exitUp(e), rank: i + 1)
                             let st = m.exitStateText(e)
                             Text(st).font(.caption).foregroundStyle(st == "지금 있음" ? .green : st == "응답 없음" ? .orange : .secondary)
+                                .lineLimit(1).truncationMode(.tail).help(st)
                             Spacer()
                             Button { exits.remove(at: i) } label: { Image(systemName: "minus.circle") }.buttonStyle(.borderless)
                         }
@@ -339,7 +340,7 @@ struct RuleForm: View {
             }
             Menu("출구 추가") {
                 ForEach(exitCandidates().filter { !exits.contains($0) }, id: \.self) { e in
-                    Button(Exits.label(e) + (m.exitUp(e) ? "" : " (지금 없음)")) { exits.append(e) }
+                    Button(Exits.label(e) + (m.exitUp(e) ? "" : " (\(m.exitAbsentReason(e) ?? "지금 없음"))")) { exits.append(e) }
                 }
             }
             .fixedSize().disabled(exits.count >= 6)

@@ -288,10 +288,20 @@ final class AppModel: ObservableObject {
         return out
     }
     func exitUp(_ name: String) -> Bool { findExit(name, in: status?.exits ?? []) != nil }
-    /// "지금 있음" / "응답 없음" / "지금 없음"
+    /// 출구가 없을 때 그 까닭 (어댑터가 안 보임, 케이블 없음 …). 엔진 상태가 바뀔 때까지 기억해 둔다.
+    private var whyCache: (stamp: Int, reasons: [String: String?]) = (-1, [:])
+    func exitAbsentReason(_ name: String) -> String? {
+        let stamp = status?.generatedAt ?? 0
+        if whyCache.stamp != stamp { whyCache = (stamp, [:]) }
+        if let r = whyCache.reasons[name] { return r }
+        let r = ExitWhy.reason(name, exits: status?.exits ?? [])
+        whyCache.reasons[name] = .some(r)
+        return r
+    }
+    /// "지금 있음" / "응답 없음" / "지금 없음 · 까닭"
     func exitStateText(_ name: String) -> String {
         let ms = matchingExits(name, in: status?.exits ?? [])
-        if ms.isEmpty { return "지금 없음" }
+        if ms.isEmpty { return exitAbsentReason(name).map { "지금 없음 · \($0)" } ?? "지금 없음" }
         return ms.contains { $0.healthy != false } ? "지금 있음" : "응답 없음"
     }
     func profileHere(_ name: String) -> Bool {
@@ -661,7 +671,15 @@ enum CLI {
             let dns = e.dns.isEmpty ? "" : " · DNS \(e.dns.prefix(2).joined(separator: ", "))"
             let mark = !e.up ? "○" : e.healthy == false ? "◐" : "●"
             let health = !e.up ? "" : e.healthy == false ? " · 응답 없음" : ""
-            print("\(head)\(mark) \(e.label.padding(toLength: 12, withPad: " ", startingAt: 0)) \(e.up ? "\(where_) · \(e.ip)\(dns)\(health)" : "연결 안 됨")")
+            print("\(head)\(mark) \(e.label.padding(toLength: 12, withPad: " ", startingAt: 0)) \(e.up ? "\(where_) · \(e.ip)\(dns)\(health)" : "연결 안 됨 · \(ExitWhy.reason(e.name, exits: s.exits) ?? "주소나 게이트웨이 없음")")")
+        }
+        // 설정에는 있는데 지금 없는 종류: 왜 없는지
+        let ports = ExitWhy.ports()
+        for kind in ["wifi", "wired", "tether"] where !s.exits.contains(where: { $0.name == kind })
+            && !ExitWhy.ports(for: kind, in: ports).isEmpty {
+            if let why = ExitWhy.reason(kind, exits: s.exits, ports: ports) {
+                print("            ○ \(Exits.label(kind).padding(toLength: 12, withPad: " ", startingAt: 0)) \(why)")
+            }
         }
     }
 
