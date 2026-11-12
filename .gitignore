@@ -3,3 +3,10 @@ docs/
 legacy/
 .DS_Store
 *.zip
+# 앱 규칙: XcodeGen 이 만드는 것 (팀 ID 가 들어감)
+apprules/*.xcodeproj
+apprules/build/
+apprules/App/Info.plist
+apprules/App/App.entitlements
+apprules/Proxy/Info.plist
+apprules/Proxy/Proxy.entitlements
