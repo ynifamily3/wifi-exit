@@ -560,11 +560,17 @@ struct RoutesWindow: View {
     @State private var zoom: Zoom?                // 하나만 보기 (더블클릭 또는 머리의 "보기" 메뉴)
     @State private var lastTargets: [String: String] = [:]
 
-    private let stage = Color(red: 0.05, green: 0.067, blue: 0.09)
-    private let panel = Color(red: 0.083, green: 0.106, blue: 0.141)
-    private let lineC = Color(red: 0.145, green: 0.188, blue: 0.255)
-    private let fg = Color(red: 0.875, green: 0.902, blue: 0.937)
-    private let muted = Color(red: 0.5, green: 0.545, blue: 0.627)
+    @Environment(\.colorScheme) private var scheme
+    @AppStorage("routesAlwaysDark") private var alwaysDark = false
+    @State private var selectedRecent: String?
+
+    /// 시스템 테마를 따른다. "늘 어둡게"를 켜면 빛나는 캡슐이 잘 보이는 어두운 화면.
+    private var dark: Bool { alwaysDark || scheme == .dark }
+    private var stage: Color { dark ? Color(red: 0.05, green: 0.067, blue: 0.09) : Color(red: 0.975, green: 0.976, blue: 0.984) }
+    private var panel: Color { dark ? Color(red: 0.083, green: 0.106, blue: 0.141) : Color.white }
+    private var lineC: Color { dark ? Color(red: 0.145, green: 0.188, blue: 0.255) : Color(white: 0.82) }
+    private var fg: Color { dark ? Color(red: 0.875, green: 0.902, blue: 0.937) : Color(white: 0.11) }
+    private var muted: Color { dark ? Color(red: 0.5, green: 0.545, blue: 0.627) : Color(white: 0.46) }
 
     private var allRules: [RuleStatus] { (m.status?.rules ?? []).filter(\.enabled) }
 
@@ -614,8 +620,7 @@ struct RoutesWindow: View {
         case .app(let a): return a
         case .rule(let r):
             if r.hasPrefix("~") { return "(규칙 없음) \(r.dropFirst())" }
-            let i = (m.status?.rules.firstIndex { $0.id == r }).map { $0 + 1 } ?? 0
-            return "#\(i) \(m.status?.rules.first { $0.id == r }?.title ?? r)"
+            return m.status?.rules.first { $0.id == r }?.title ?? r
         case .exit(let x): return x == "block" ? "차단된 연결" : "\(exits.first { $0.iface == x }?.label ?? x)(\(x))"
         }
     }
@@ -655,9 +660,15 @@ struct RoutesWindow: View {
         }
         lastTargets = now
     }
+    private var statusLine: String {
+        stream.replaying ? "되감기 중 · \(stream.replayCursor.map(timeString) ?? "")"
+            : stream.connected ? "보는 중 · 최근 1분 \(stream.scene.hits.filter { $0.1.hasPrefix("x:") }.count)건"
+            : (stream.problem ?? "엔진에 붙는 중…")
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            header
+            zoomBanner
             GeometryReader { geo in
               let stageH = max(geo.size.height, stageNeeded)
               ScrollView(.vertical) {
@@ -711,6 +722,9 @@ struct RoutesWindow: View {
         .onChange(of: m.status?.generatedAt) { stream.refreshSamplerContext() }
         .onAppear { lastTargets = targetSignature }
         .navigationTitle("라우팅 보기")
+        .navigationSubtitle(statusLine)
+        .toolbar { toolbarContent }
+        .preferredColorScheme(alwaysDark ? .dark : nil)
     }
 
     /// 규칙 밖 칸에서 새 규칙 초안을 만든다 (그 칸으로 간 IPv4 들, 메모는 도메인).
@@ -726,17 +740,23 @@ struct RoutesWindow: View {
 
     // MARK: 머리
 
-    private var header: some View {
-      VStack(spacing: 0) {
-        HStack(spacing: 12) {
-            Circle().fill(stream.connected ? Color.green : Color.orange).frame(width: 8, height: 8)
-            Text(stream.replaying ? "되감기 중 · \(stream.replayCursor.map(timeString) ?? "")"
-                 : stream.connected ? "보는 중 · 최근 1분 \(stream.scene.hits.filter { $0.1.hasPrefix("x:") }.count)건"
-                                    : (stream.problem ?? "엔진에 붙는 중…"))
-                .font(.callout).foregroundStyle(stream.replaying ? Color.orange : fg)
-            Spacer()
+    @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            if let f = focusRule, f.hasPrefix("~") {
+                Button { makeRule(from: f) } label: { Label("이 목적지로 규칙 만들기", systemImage: "plus.circle") }
+                    .help("이 칸으로 간 IP들로 새 규칙을 편집 창에 채워 둬요. 역방향 조회 이름은 실제 도메인과 다를 수 있어 IP로 넣어요.")
+            }
+            if focusRule != nil || focusExit != nil {
+                Button("강조 해제") { focusRule = nil; focusExit = nil }
+            }
+            Picker("범위", selection: Binding(get: { stream.allTraffic }, set: { stream.setAllTraffic($0) })) {
+                Text("규칙 대상만").tag(false)
+                Text("모든 연결").tag(true)
+            }
+            .pickerStyle(.segmented).fixedSize()
+            .help("모든 연결: 규칙에 없는 연결도 (규칙 없음) 칸으로 보여 줘요. 연결 표를 1초마다 훑어서, 아주 짧은 연결은 놓칠 수 있어요.")
             Menu {
-                Button("전체") { setZoom(nil) }
+                Button("없음 (전체)") { setZoom(nil) }
                 Section("앱") { ForEach(knownApps, id: \.self) { a in Button(a) { setZoom(.app(a)) } } }
                 Section("규칙") {
                     ForEach(allRules) { r in Button(zoomLabel(.rule(r.id))) { setZoom(.rule(r.id)) } }
@@ -747,42 +767,31 @@ struct RoutesWindow: View {
                     Button("차단된 연결") { setZoom(.exit("block")) }
                 }
             } label: {
-                Label(zoom.map { "보기: \(zoomLabel($0))" } ?? "보기: 전체", systemImage: zoom == nil ? "square.stack.3d.up" : "scope")
+                Label(zoom.map { "집중: \(zoomLabel($0))" } ?? "집중: 없음", systemImage: zoom == nil ? "scope" : "scope")
             }
-            .fixedSize()
             .help("앱·규칙·출구 하나만 골라 그것과 이어진 연결만 봐요. 칸을 두 번 눌러도 돼요.")
-            Picker("", selection: Binding(get: { stream.allTraffic }, set: { stream.setAllTraffic($0) })) {
-                Text("규칙 대상만").tag(false)
-                Text("전체").tag(true)
-            }
-            .pickerStyle(.segmented).labelsHidden().fixedSize()
-            .help("전체: 규칙에 없는 연결도 (규칙 없음) 칸으로 보여 줘요. 연결 표를 1초마다 훑어서, 아주 짧은 연결은 놓칠 수 있어요.")
-            if let f = focusRule, f.hasPrefix("~") {
-                Button { makeRule(from: f) } label: { Label("이 목적지로 규칙 만들기", systemImage: "plus.circle") }
-                    .help("이 칸으로 간 IP들로 새 규칙을 편집 창에 채워 둬요. 역방향 조회 이름은 실제 도메인과 다를 수 있어 IP로 넣어요.")
-            }
-            if focusRule != nil || focusExit != nil {
-                Button("강조 해제") { focusRule = nil; focusExit = nil }
-            }
-            Toggle(isOn: $paused) { Label("일시정지", systemImage: "pause.fill") }.toggleStyle(.button)
+            Toggle(isOn: $paused) { Label("기록 멈춤", systemImage: "pause.fill") }
+                .help("화면 기록만 멈춰요. 규칙 적용은 계속돼요.")
+            Toggle(isOn: $alwaysDark) { Label("늘 어둡게", systemImage: "moon") }
+                .help("시스템 테마와 상관없이 어두운 화면으로 (캡슐이 더 잘 보여요)")
             Button { NSApp.activate(ignoringOtherApps: true); openWindow(id: "rules") } label: { Label("규칙 편집", systemImage: "list.bullet.rectangle") }
+                .help("규칙 편집")
         }
-        .padding(.horizontal, 14).padding(.vertical, 8)
+    }
+
+    @ViewBuilder private var zoomBanner: some View {
         if let z = zoom {
             HStack(spacing: 8) {
                 if case .app(let a) = z, let icon = stream.scene.icons[a] { Image(nsImage: icon).resizable().frame(width: 16, height: 16) }
-                else { Image(systemName: "scope").foregroundStyle(fg) }
-                Text("\(zoomLabel(z))만 보는 중").font(.callout.bold()).foregroundStyle(fg)
-                Text(zoomHint(z)).font(.caption).foregroundStyle(muted)
+                else { Image(systemName: "scope") }
+                Text("\(zoomLabel(z))만 보는 중").font(.callout.bold())
+                Text(zoomHint(z)).font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("전체로") { setZoom(nil) }
             }
-            .padding(.horizontal, 14).padding(.vertical, 5)
-            .background(Color.accentColor.opacity(0.18))
+            .padding(.horizontal, 14).padding(.vertical, 6)
+            .background(Color.accentColor.opacity(0.14))
         }
-      }
-      .background(panel)
-      .environment(\.colorScheme, .dark)
     }
 
     private func zoomHint(_ z: Zoom) -> String {
@@ -825,7 +834,7 @@ struct RoutesWindow: View {
     }
 
     private func exitColor(_ e: ExitInfo?) -> Color { e.map { Color.exit($0.name) } ?? muted }
-    private let blockC = Color(red: 0.94, green: 0.39, blue: 0.44)
+    private var blockC: Color { Color.exit("block") }
 
     private func dimmed(rule: String?, iface: String?) -> Bool {
         if let f = focusRule, f != rule { return true }
@@ -997,7 +1006,7 @@ struct RoutesWindow: View {
             c.fill(Path(roundedRect: rect, cornerRadius: 7), with: .color(panel))
             c.stroke(Path(roundedRect: rect, cornerRadius: 7), with: .color(focusRule == r.id ? col : lineC), lineWidth: focusRule == r.id ? 1.6 : 1)
             let pos = (m.status?.rules.firstIndex { $0.id == r.id } ?? i) + 1
-            c.draw(Text("#\(pos)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.minX + 8, y: p.y), anchor: .leading)
+            c.draw(Text("\(pos)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.minX + 8, y: p.y), anchor: .leading)
             let n = scene.count("r:\(r.id)")
             let room = w - 34 - (n > 0 ? 26 : 8)
             let fs: CGFloat = h < 26 ? 11 : 12
@@ -1024,10 +1033,14 @@ struct RoutesWindow: View {
             c.fill(Path(roundedRect: rect, cornerRadius: 8), with: .color(e.up ? col.opacity(0.12) : stage))
             c.stroke(Path(roundedRect: rect, cornerRadius: 8), with: .color(down ? Color.orange : col.opacity(e.up ? 0.9 : 0.5)),
                      style: StrokeStyle(lineWidth: 1.2, dash: e.up ? [] : [4, 4]))
-            let eroom = w - 10 - 26
-            c.draw(Text(fit(e.label, 12.5, .semibold, false, eroom, .tail)).font(.system(size: 12.5, weight: .semibold)).foregroundColor(e.up ? col : muted), at: CGPoint(x: rect.minX + 10, y: p.y - 7), anchor: .leading)
-            c.draw(Text(fit(e.up ? (down ? "\(e.iface) · 응답 없음" : e.iface) : "\(e.iface) · 연결 안 됨", 10, .regular, true, w - 18, .tail)).font(.system(size: 10, design: .monospaced)).foregroundColor(down ? .orange : muted),
-                   at: CGPoint(x: rect.minX + 10, y: p.y + 9), anchor: .leading)
+            let bc = CGPoint(x: rect.minX + 19, y: p.y)
+            c.fill(Path(ellipseIn: CGRect(x: bc.x - 11, y: bc.y - 11, width: 22, height: 22)), with: .color(e.up ? col : muted.opacity(0.6)))
+            c.draw(Text(Image(systemName: Exits.symbol(e.name))).font(.system(size: 11, weight: .semibold)).foregroundColor(.white), at: bc)
+            let tx = rect.minX + 36
+            let eroom = rect.maxX - tx - 22
+            c.draw(Text(fit(e.label, 12.5, .semibold, false, eroom, .tail)).font(.system(size: 12.5, weight: .semibold)).foregroundColor(e.up ? fg : muted), at: CGPoint(x: tx, y: p.y - 7), anchor: .leading)
+            c.draw(Text(fit(e.up ? (down ? "\(e.iface) · 응답 없음" : e.iface) : "\(e.iface) · 연결 안 됨", 10, .regular, true, rect.maxX - tx - 8, .tail)).font(.system(size: 10, design: .monospaced)).foregroundColor(down ? .orange : muted),
+                   at: CGPoint(x: tx, y: p.y + 9), anchor: .leading)
             let n = scene.count("x:\(e.iface)")
             if n > 0 { c.draw(Text("\(n)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.maxX - 8, y: p.y - 7), anchor: .trailing) }
         }
@@ -1036,14 +1049,12 @@ struct RoutesWindow: View {
             let rect = CGRect(x: p.x - w / 2, y: p.y - h / 2, width: w, height: h)
             var c = ctx
             c.opacity = dimmed(rule: nil, iface: "block") ? 0.35 : 1
-            c.fill(Path(roundedRect: rect, cornerRadius: 6), with: .color(blockC.opacity(0.1)))
-            var hatch = Path()
-            var x = rect.minX - h
-            while x < rect.maxX { hatch.move(to: CGPoint(x: x, y: rect.maxY)); hatch.addLine(to: CGPoint(x: x + h, y: rect.minY)); x += 9 }
-            c.clip(to: Path(roundedRect: rect, cornerRadius: 6))
-            c.stroke(hatch, with: .color(blockC.opacity(0.22)), lineWidth: 1)
-            c.stroke(Path(roundedRect: rect, cornerRadius: 6), with: .color(blockC), lineWidth: 1.2)
-            c.draw(Text("차단 (pf)").font(.system(size: 12.5, weight: .semibold)).foregroundColor(blockC), at: p)
+            c.fill(Path(roundedRect: rect, cornerRadius: 8), with: .color(blockC.opacity(0.08)))
+            c.stroke(Path(roundedRect: rect, cornerRadius: 8), with: .color(blockC), style: StrokeStyle(lineWidth: 1.2, dash: [4, 3]))
+            let bc = CGPoint(x: rect.minX + 19, y: p.y)
+            c.fill(Path(ellipseIn: CGRect(x: bc.x - 11, y: bc.y - 11, width: 22, height: 22)), with: .color(blockC))
+            c.draw(Text(Image(systemName: "nosign")).font(.system(size: 11, weight: .semibold)).foregroundColor(.white), at: bc)
+            c.draw(Text("차단 (pf)").font(.system(size: 12.5, weight: .semibold)).foregroundColor(fg), at: CGPoint(x: rect.minX + 36, y: p.y), anchor: .leading)
             let n = scene.count("x:block")
             if n > 0 { c.draw(Text("\(n)").font(.system(size: 10, design: .monospaced)).foregroundColor(muted), at: CGPoint(x: rect.maxX - 8, y: rect.minY + 10), anchor: .trailing) }
         }
@@ -1255,7 +1266,7 @@ struct RoutesWindow: View {
                     let bw = size.width / CGFloat(bins)
                     for i in 0..<bins {
                         var y = size.height
-                        for (n, c) in [(pass[i], Color.teal), (out[i], muted), (block[i], blockC)] where n > 0 {
+                        for (n, c) in [(pass[i], Color.accentColor), (out[i], muted), (block[i], blockC)] where n > 0 {
                             let h = CGFloat(n) / CGFloat(peak) * (size.height - 4)
                             ctx.fill(Path(CGRect(x: CGFloat(i) * bw + 1, y: y - h, width: bw - 2, height: h)), with: .color(c.opacity(0.75)))
                             y -= h
@@ -1288,32 +1299,49 @@ struct RoutesWindow: View {
                 .disabled(!stream.replaying && cursor == nil)
         }
         .padding(.horizontal, 14).padding(.vertical, 6)
-        .background(panel)
-        .environment(\.colorScheme, .dark)
+        .background(.bar)
     }
 
     // MARK: 최근 연결
 
+    struct RecentRow: Identifiable { let id: String; let e: ConnEvent }
+
+    private var recentRows: [RecentRow] {
+        var seen: [String: Int] = [:]
+        return stream.recent.filter { e in zoom.map { $0.matches(e, app: RouteScene.appLabel(e), slot: stream.scene.slot(for: e)) } ?? true }
+            .prefix(150).map { e in
+                let k = "\(e.t)|\(e.flowKey)|\(e.act)|\(e.kind ?? "")"
+                let n = seen[k, default: 0]; seen[k] = n + 1
+                return RecentRow(id: n == 0 ? k : "\(k)#\(n)", e: e)
+            }
+    }
+
     private var recentList: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("최근 연결").font(.caption.bold()).foregroundStyle(muted)
-                Spacer()
-                Text("줄을 누르면 그 길을 다시 그려요").font(.caption2).foregroundStyle(muted)
-            }
-            .padding(.horizontal, 14).padding(.top, 6).padding(.bottom, 2)
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(Array(stream.recent.filter { e in zoom.map { $0.matches(e, app: RouteScene.appLabel(e), slot: stream.scene.slot(for: e)) } ?? true }.prefix(100).enumerated()), id: \.offset) { _, e in
-                        Button { stream.scene.ingest(e, replay: true); stream.animating = true } label: { recentRow(e) }
-                            .buttonStyle(.plain)
-                    }
+        Table(recentRows, selection: $selectedRecent) {
+            TableColumn("시간") { r in Text(timeString(r.e.t)).monospacedDigit().foregroundStyle(.secondary) }
+                .width(min: 60, ideal: 66, max: 80)
+            TableColumn("앱") { r in Text(RouteScene.appLabel(r.e)).lineLimit(1) }
+                .width(min: 80, ideal: 130, max: 200)
+            TableColumn("목적지") { r in Text("\(hostName(r.e)):\(r.e.dport) \(r.e.proto)").font(.system(.body, design: .monospaced)).lineLimit(1).truncationMode(.middle) }
+                .width(min: 140, ideal: 260)
+            TableColumn("규칙") { r in Text(ruleText(r.e)).foregroundStyle(.secondary).lineLimit(1) }
+                .width(min: 80, ideal: 150, max: 240)
+            TableColumn("결과") { r in
+                let ex = exits.first { $0.iface == r.e.iface }
+                HStack(spacing: 6) {
+                    Circle().fill(r.e.act == "block" ? blockC : exitColor(ex)).frame(width: 8, height: 8)
+                    Text(r.e.act == "block" ? "막힘 · " + resultText(r.e) : resultText(r.e)).lineLimit(1)
                 }
-                .padding(.horizontal, 14).padding(.bottom, 6)
             }
-            .frame(height: 150)
+            .width(min: 120, ideal: 220)
         }
-        .background(panel)
+        .tableStyle(.inset(alternatesRowBackgrounds: true))
+        .frame(height: 170)
+        .onChange(of: selectedRecent) { _, id in
+            guard let id, let r = recentRows.first(where: { $0.id == id }) else { return }
+            stream.scene.ingest(r.e, replay: true); stream.animating = true
+        }
+        .help("줄을 고르면 그 길을 다시 그려요")
     }
 
     private func recentRow(_ e: ConnEvent) -> some View {

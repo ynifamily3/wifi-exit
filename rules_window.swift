@@ -13,14 +13,27 @@ struct RulesWindow: View {
     private var rules: [Rule] { m.config?.rules ?? [] }
     private var profiles: [(String, NetProfile)] { (m.config?.profiles ?? [:]).sorted { $0.key < $1.key } }
 
+    private var detailTitle: String {
+        guard let sel = m.windowSelection else { return "규칙" }
+        if sel == "new" { return "새 규칙" }
+        if sel.hasPrefix("rule:"), let r = rules.first(where: { "rule:" + $0.id == sel }) { return r.title }
+        if sel.hasPrefix("profile:") { return String(sel.dropFirst(8)) }
+        return "규칙"
+    }
+
     var body: some View {
         NavigationSplitView {
             List(selection: $m.windowSelection) {
-                Section("규칙 · 위에서부터 적용") {
-                    ForEach(Array(rules.enumerated()), id: \.element.id) { i, r in
-                        RuleListItem(rule: r, index: i, status: m.status?.rules.first { $0.id == r.id }, statusAll: m.status,
-                                     dirty: m.drafts["rule:" + r.id]?.isDirty == true)
+                Section("규칙 · 위에서부터") {
+                    ForEach(rules, id: \.id) { r in
+                        RuleListItem(rule: r, status: m.status?.rules.first { $0.id == r.id },
+                                     shadowedBy: m.shadowedBy(r), dirty: m.drafts["rule:" + r.id]?.isDirty == true)
                             .tag("rule:" + r.id)
+                            .contextMenu {
+                                Button(r.enabled ? "끄기" : "켜기") { Task { await m.setEnabled(r.id, !r.enabled) } }
+                                Divider()
+                                Button("삭제", role: .destructive) { Task { await m.remove(r.id) } }
+                            }
                     }
                     .onMove { from, to in
                         guard let i = from.first else { return }
@@ -31,31 +44,23 @@ struct RulesWindow: View {
                 }
                 Section("네트워크 프로필") {
                     ForEach(profiles, id: \.0) { name, p in
-                        HStack(spacing: 6) {
-                            Image(systemName: m.profileHere(name) ? "location.fill" : "location").foregroundStyle(m.profileHere(name) ? .green : .secondary)
-                            Text(name)
-                            Spacer()
-                            Text(Exits.label(p.link)).font(.caption).foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            ZStack {
+                                Circle().fill(m.profileHere(name) ? Color.green : Color.secondary.opacity(0.45))
+                                Image(systemName: "location.fill").font(.system(size: 10, weight: .semibold)).foregroundStyle(.white)
+                            }.frame(width: 22, height: 22)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(name)
+                                Text(Exits.label(p.link) + " 게이트웨이" + (m.profileHere(name) ? " · 지금 여기" : ""))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                         }
                         .tag("profile:" + name)
                     }
-                    if profiles.isEmpty { Text("없음 — 위 + 메뉴로 지금 망 저장").font(.caption).foregroundStyle(.secondary) }
+                    if profiles.isEmpty { Text("없음 — + 메뉴로 지금 망 저장").font(.caption).foregroundStyle(.secondary) }
                 }
             }
-            .navigationSplitViewColumnWidth(min: 230, ideal: 270)
-            .toolbar {
-                ToolbarItem {
-                    Button { NSApp.activate(ignoringOtherApps: true); openWindow(id: "routes") } label: {
-                        Image(systemName: "point.3.connected.trianglepath.dotted")
-                    }.help("라우팅 보기")
-                }
-                ToolbarItem {
-                    Menu {
-                        Button("새 규칙") { m.windowSelection = "new" }
-                        Button("지금 망을 프로필로 저장…") { Task { await m.saveProfile() } }
-                    } label: { Image(systemName: "plus") }
-                }
-            }
+            .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
             Group {
                 if let sel = m.windowSelection, sel.hasPrefix("rule:"), let i = rules.firstIndex(where: { "rule:" + $0.id == sel }) {
@@ -65,42 +70,48 @@ struct RulesWindow: View {
                 } else if let sel = m.windowSelection, sel.hasPrefix("profile:"), let p = m.config?.profiles[String(sel.dropFirst(8))] {
                     ProfileDetail(name: String(sel.dropFirst(8)), profile: p)
                 } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "list.bullet.rectangle").font(.largeTitle).foregroundStyle(.tertiary)
-                        Text("왼쪽에서 규칙을 고르거나 + 로 새 규칙을 만드세요").foregroundStyle(.secondary)
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ContentUnavailableView("규칙을 고르세요", systemImage: "list.bullet.rectangle",
+                                           description: Text("왼쪽에서 규칙을 고르거나 + 로 새 규칙을 만드세요"))
                 }
             }
-            .navigationTitle("Wi-Fi Exit 규칙")
+            .navigationTitle(detailTitle)
+            .toolbar {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button { NSApp.activate(ignoringOtherApps: true); openWindow(id: "routes") } label: {
+                        Label("라우팅 보기", systemImage: "point.3.connected.trianglepath.dotted")
+                    }.help("라우팅 보기")
+                    Menu {
+                        Button("새 규칙") { m.windowSelection = "new" }
+                        Button("지금 망을 프로필로 저장…") { Task { await m.saveProfile() } }
+                    } label: { Label("추가", systemImage: "plus") }
+                    .help("새 규칙 · 프로필")
+                }
+            }
         }
-        .frame(minWidth: 780, minHeight: 540)
+        .frame(minWidth: 780, minHeight: 560)
         .task { await m.refresh() }
     }
 }
 
 struct RuleListItem: View {
     let rule: Rule
-    let index: Int
     let status: RuleStatus?
-    let statusAll: EngineStatus?
+    var shadowedBy: String? = nil
     var dirty = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 6) {
-            Text("\(index + 1)").font(.caption.monospaced()).foregroundStyle(.tertiary).frame(width: 18, alignment: .trailing)
-            if let s = status, let all = statusAll {
-                Image(systemName: all.state(of: s).symbol).foregroundStyle(all.state(of: s).color).frame(width: 14)
-            }
+        HStack(spacing: 9) {
+            ExitBadge(name: status?.nowExit ?? rule.exits.first ?? "block",
+                      off: !rule.enabled || status?.nowExit == nil, size: 22)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
-                    Text(rule.name.isEmpty ? rule.targets.joined(separator: ", ") : rule.name).lineLimit(1)
-                        .foregroundStyle(rule.enabled ? .primary : .secondary)
+                    Text(rule.title).lineLimit(1).foregroundStyle(rule.enabled ? .primary : .secondary)
                     if dirty { Circle().fill(Color.orange).frame(width: 6, height: 6).help("저장하지 않은 편집이 있어요") }
                 }
-                Text((rule.name.isEmpty ? "" : rule.targets.joined(separator: ", ") + " · ") + rule.exitsText)
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                if !rule.when.isAlways {
-                    Text("조건 " + rule.when.text).font(.caption2.monospaced()).foregroundStyle(.tertiary).lineLimit(1)
+                if let by = shadowedBy {
+                    Text("⚠︎ \"\(by)\"에 가려짐").font(.caption).foregroundStyle(.orange).lineLimit(1)
+                } else {
+                    Text(rule.enabled ? rule.settingsText : "꺼짐").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
         }
@@ -213,67 +224,108 @@ struct RuleForm: View {
         return o != r
     }
 
+    @State private var confirmDelete = false
+
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if staleBase {
+            Form {
+                if staleBase {
+                    Section {
                         HStack {
-                            Label("이 규칙이 다른 곳(CLI 등)에서 바뀌었어요. 지금 보이는 건 내가 고치던 내용이에요.", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                            Label("이 규칙이 다른 곳(팝업·CLI)에서 바뀌었어요. 지금 보이는 건 고치던 내용이에요.", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
                                 .foregroundStyle(.orange)
                             Spacer()
-                            Button("새 내용 불러오기") { m.drafts[key] = RuleDraft(original) }
+                            Button("다시 불러오기") { m.drafts[key] = RuleDraft(original) }
                         }
-                        .padding(10)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.1)))
                     }
-                    header
-                    section("대상", "IP, IP/프리픽스, 도메인. 도메인은 고른 출구의 DNS로 5분마다 다시 풀어요.") { targetsEditor }
-                    section("출구 순위", "쓸 수 있는 첫 출구로 보내고, 다른 출구로는 막아요. 끌어서 순서를 바꿔요.") { exitsEditor }
-                    section("상태 점검 대상 (선택)", "비워 두면 출구 자체가 응답하는지만 봐요. host:port 를 넣으면 그 출구로 여기에 닿을 때만 그 출구를 써요.") {
-                        TextField("예: git.example.corp:443", text: bind(\.check))
-                            .textFieldStyle(.roundedBorder).font(.callout.monospaced()).frame(maxWidth: 320)
-                    }
-                    section("쓸 수 있는 출구가 없을 때", nil) {
-                        Picker("", selection: bind(\.elseAction)) {
-                            Text("차단 (다른 길로 새지 않음)").tag("block")
-                            Text("평소 경로").tag("system")
-                            Text("다음 규칙에 넘김").tag("next")
-                        }.pickerStyle(.segmented).labelsHidden().fixedSize()
-                    }
-                    section("조건", "맞을 때만 이 규칙을 적용해요. 안 맞으면 건너뛰고 다음 규칙이 맡아요.") { conditionEditor }
-                    preview
                 }
-                .padding(20)
-                .frame(maxWidth: 720, alignment: .leading)
+                Section { header }
+                if !notices.isEmpty {
+                    Section {
+                        ForEach(notices, id: \.self) { w in
+                            Label(w, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        }
+                    }
+                }
+                Section {
+                    TextField("이름(메모)", text: bind(\.name), prompt: Text("예: 개인 서버"))
+                }
+                Section("대상") { targetsEditor }
+                Section {
+                    exitsEditor
+                } header: { Text("출구 순위") } footer: {
+                    Text("쓸 수 있는 첫 출구로 보내고, 그 출구가 아닌 곳으로는 막아요.").font(.caption).foregroundStyle(.secondary)
+                }
+                Section("동작") { behaviorEditor }
             }
+            .formStyle(.grouped)
             Divider()
-            footer.padding(.horizontal, 20).padding(.vertical, 10)
+            footer.padding(.horizontal, 16).padding(.vertical, 10)
         }
         .onAppear(perform: syncDraft)
         .onChange(of: original) { syncDraft() }
+        .confirmationDialog("이 규칙을 지울까요?", isPresented: $confirmDelete) {
+            Button("삭제", role: .destructive) { if let o = original { Task { await m.remove(o.id); m.windowSelection = nil } } }
+        } message: { Text(original?.title ?? "") }
+    }
+
+    // MARK: 머리: 지금이라면 어디로
+
+    private var outcome: (Outcome, Facts, EngineConfig)? {
+        guard let d = draft, let s = m.status, let c = m.config else { return nil }
+        let f = CLI.facts(s, c)
+        return (c.paused ? .off : decide(d, facts: f), f, c)
+    }
+
+    private func headline(_ o: Outcome) -> String {
+        switch o {
+        case .route(let n, let e): return "\(Exits.label(n))(\(e.iface))로 보내는 중"
+        case .block: return "막는 중"
+        case .system: return "평소 경로로 둠"
+        case .next: return "다음 규칙으로 넘김"
+        case .skip: return "조건이 안 맞아 건너뜀"
+        case .off: return d.enabled ? "일시정지 중" : "꺼짐"
+        }
+    }
+
+    @ViewBuilder private var header: some View {
+        HStack(spacing: 12) {
+            if let (o, f, c) = outcome, let dr = draft {
+                switch o {
+                case .route(let n, _): ExitBadge(name: n, size: 38)
+                case .block: ExitBadge(name: "block", size: 38)
+                default: ExitBadge(name: dr.exits.first ?? "wifi", off: true, size: 38)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(headline(o)).font(.title3.bold())
+                    Text(reasonText(dr, o, facts: f, paused: c.paused)).font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                ExitBadge(name: d.exits.first ?? "wifi", off: true, size: 38)
+                Text(original == nil ? "새 규칙" : "상태를 읽는 중").font(.title3.bold())
+            }
+            Spacer()
+            Toggle("켜기", isOn: bind(\.enabled)).toggleStyle(.switch).labelsHidden().help("이 규칙 켜기")
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// 가려짐·터널 보호 같은 알림 (지금 자리에 둔 목록으로 따진다)
+    private var notices: [String] {
+        guard let dr = draft, let c = m.config else { return [] }
+        var rs = c.rules
+        if let i = rs.firstIndex(where: { $0.id == dr.id }) { rs[i] = dr } else { rs.append(dr) }
+        let idx = rs.firstIndex { $0.id == dr.id } ?? rs.count - 1
+        var out = shadowWarnings(rs, index: idx, addresses: m.resolvedIPs)
+        if let st = m.status?.rules.first(where: { $0.id == dr.id }) { out += st.addresses.compactMap(\.note) }
+        return out
     }
 
     /// 초안을 준비한다. 고친 게 없는데 원본이 바뀌었으면 새 원본으로 다시 시작한다.
     private func syncDraft() {
         if let cur = m.drafts[key], cur.isDirty { return }
         m.drafts[key] = RuleDraft(original)
-    }
-
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            if original != nil { Text("#\(index + 1)").font(.title3.monospaced()).foregroundStyle(.tertiary) } else { Text("새 규칙").font(.title3.bold()) }
-            TextField("메모 (예: 개인 서버)", text: bind(\.name)).textFieldStyle(.roundedBorder).font(.title3)
-            Toggle("켜기", isOn: bind(\.enabled)).toggleStyle(.switch)
-        }
-    }
-
-    private func section<C: View>(_ title: String, _ hint: String?, @ViewBuilder _ content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.headline)
-            if let hint { Text(hint).font(.caption).foregroundStyle(.secondary) }
-            content()
-        }
     }
 
     // MARK: 대상
@@ -284,26 +336,25 @@ struct RuleForm: View {
         return Target.parse(t) == nil ? "IPv4, IPv4/프리픽스(8–32), 도메인만 넣을 수 있어요" : nil
     }
 
-    private var targetsEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            FlowRow(items: targets) { t in
-                HStack(spacing: 4) {
-                    Text(t).font(.callout.monospaced())
-                    if let ips = m.resolvedIPs[t], !ips.isEmpty {
-                        Text(ips.prefix(3).joined(separator: ", ") + (ips.count > 3 ? " …" : "")).font(.caption2.monospaced()).foregroundStyle(.secondary)
-                    }
-                    Button { targets.removeAll { $0 == t } } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.borderless).foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(Capsule().fill(Color.primary.opacity(0.07)))
-            }
+    @ViewBuilder private var targetsEditor: some View {
+        ForEach(targets, id: \.self) { t in
+            let ips = m.resolvedIPs[t] ?? []
             HStack {
-                TextField("추가할 대상", text: bind(\.newTarget)).textFieldStyle(.roundedBorder).font(.callout.monospaced())
-                    .frame(maxWidth: 280).onSubmit(addTarget)
-                Button("추가", action: addTarget).disabled(newTarget.trimmingCharacters(in: .whitespaces).isEmpty || targetError != nil)
-                if let e = targetError { Text(e).font(.caption).foregroundStyle(.red) }
+                Text(t).font(.body.monospaced()).textSelection(.enabled)
+                Spacer()
+                if !ips.isEmpty {
+                    Text("IP \(ips.count)개").foregroundStyle(.secondary)
+                        .help(ips.joined(separator: "\n"))
+                }
+                Button { targets.removeAll { $0 == t } } label: { Image(systemName: "minus.circle.fill") }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary).help("대상에서 빼기")
             }
+        }
+        HStack {
+            Image(systemName: "plus").foregroundStyle(Color.accentColor)
+            TextField("", text: bind(\.newTarget), prompt: Text("IP, 대역, 도메인 추가 — Return"))
+                .labelsHidden().textFieldStyle(.plain).onSubmit(addTarget)
+            if let e = targetError { Text(e).font(.caption).foregroundStyle(.red) }
         }
     }
 
@@ -315,63 +366,88 @@ struct RuleForm: View {
 
     // MARK: 출구
 
-    private var exitsEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if exits.isEmpty {
-                Text("출구 없음 — 이 대상은 늘 막아요 (없을 때 설정에 따라)").font(.callout).foregroundStyle(.secondary)
-            } else {
-                List {
-                    ForEach(Array(exits.enumerated()), id: \.element) { i, e in
-                        HStack(spacing: 8) {
-                            Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
-                            ExitChip(name: e, label: Exits.label(e), active: m.exitUp(e), rank: i + 1)
-                            let st = m.exitStateText(e)
-                            Text(st).font(.caption).foregroundStyle(st == "지금 있음" ? .green : st == "응답 없음" ? .orange : .secondary)
-                                .lineLimit(1).truncationMode(.tail).help(st)
-                            Spacer()
-                            Button { exits.remove(at: i) } label: { Image(systemName: "minus.circle") }.buttonStyle(.borderless)
-                        }
-                    }
-                    .onMove { exits.move(fromOffsets: $0, toOffset: $1) }
-                }
-                .listStyle(.bordered(alternatesRowBackgrounds: false))
-                .scrollDisabled(true)
-                .frame(maxWidth: 460, minHeight: CGFloat(exits.count) * 30 + 8, maxHeight: CGFloat(exits.count) * 30 + 8)
-            }
-            Menu("출구 추가") {
-                ForEach(exitCandidates().filter { !exits.contains($0) }, id: \.self) { e in
-                    Button(Exits.label(e) + (m.exitUp(e) ? "" : " (\(m.exitAbsentReason(e) ?? "지금 없음"))")) { exits.append(e) }
-                }
-            }
-            .fixedSize().disabled(exits.count >= 6)
+    private func exitDetail(_ e: String) -> (String, Color) {
+        let ms = matchingExits(e, in: m.status?.exits ?? [])
+        if let x = ms.first(where: { $0.healthy != false }) { return ("\(x.iface) · 연결됨", .secondary) }
+        if let x = ms.first { return ("\(x.iface) · 응답 없음", .orange) }
+        return (m.exitAbsentReason(e) ?? "지금 없음", .secondary)
+    }
+
+    @ViewBuilder private var exitsEditor: some View {
+        if exits.isEmpty {
+            Text("출구 없음 — 이 대상은 늘 막아요").foregroundStyle(.secondary)
         }
+        ForEach(Array(exits.enumerated()), id: \.element) { i, e in
+            let (detail, dc) = exitDetail(e)
+            HStack(spacing: 10) {
+                Text("\(i + 1)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary).frame(width: 12)
+                ExitBadge(name: e, off: !m.exitUp(e), size: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(Exits.label(e))
+                    Text(detail).font(.caption).foregroundStyle(dc).lineLimit(1)
+                }
+                Spacer()
+                if exits.count > 1 {
+                    Button { exits.swapAt(i, i - 1) } label: { Image(systemName: "chevron.up") }
+                        .buttonStyle(.borderless).disabled(i == 0).help("위로")
+                    Button { exits.swapAt(i, i + 1) } label: { Image(systemName: "chevron.down") }
+                        .buttonStyle(.borderless).disabled(i == exits.count - 1).help("아래로")
+                }
+                Button { exits.remove(at: i) } label: { Image(systemName: "minus.circle.fill") }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary).help("출구 빼기")
+            }
+        }
+        Menu {
+            ForEach(exitCandidates().filter { !exits.contains($0) }, id: \.self) { e in
+                Button(Exits.label(e) + (m.exitUp(e) ? "" : " (\(m.exitAbsentReason(e) ?? "지금 없음"))")) { exits.append(e) }
+            }
+        } label: { Label("출구 추가", systemImage: "plus") }
+        .menuStyle(.borderlessButton).fixedSize().disabled(exits.count >= 6)
     }
 
     // MARK: 조건
 
-    private var conditionEditor: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Picker("", selection: Binding(get: { mode }, set: switchMode)) {
-                Text("항상").tag(CondMode.always)
-                Text("조건 빌더").tag(CondMode.builder)
-                Text("글로 쓰기").tag(CondMode.text)
-            }.pickerStyle(.segmented).labelsHidden().fixedSize()
-
-            switch mode {
-            case .always:
-                Text("언제나 적용해요.").font(.callout).foregroundStyle(.secondary)
-            case .builder:
-                GroupEditor(group: bind(\.group), nested: false)
-            case .text:
-                TextField("예: vpn=pass and (link=wired or profile=사무실)", text: bind(\.text), axis: .vertical)
-                    .textFieldStyle(.roundedBorder).font(.callout.monospaced()).lineLimit(1...4).frame(maxWidth: 560)
+    @ViewBuilder private var behaviorEditor: some View {
+        Picker("쓸 수 있는 출구가 없을 때", selection: bind(\.elseAction)) {
+            Text("차단 (다른 길로 새지 않음)").tag("block")
+            Text("평소 경로").tag("system")
+            Text("다음 규칙에 넘김").tag("next")
+        }
+        Picker(selection: Binding(get: { mode }, set: switchMode)) {
+            Text("항상").tag(CondMode.always)
+            Text("조건 빌더").tag(CondMode.builder)
+            Text("글로 쓰기").tag(CondMode.text)
+        } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("조건")
+                Text("맞을 때만 적용, 안 맞으면 다음 규칙").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        switch mode {
+        case .always:
+            EmptyView()
+        case .builder:
+            GroupEditor(group: bind(\.group), nested: false)
+        case .text:
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("", text: bind(\.text), prompt: Text("예: vpn=pass and (link=wired or profile=사무실)"), axis: .vertical)
+                    .labelsHidden().textFieldStyle(.roundedBorder).font(.callout.monospaced()).lineLimit(1...4)
                 Text("키: vpn= link= profile= default= vpnover= time=09:00-18:00 day=mon-fri · 연산: = != and or not ( )")
                     .font(.caption).foregroundStyle(.secondary)
                 if case .success(let c) = condition, c.builder == nil, !c.isAlways {
                     Text("이 조건은 빌더로 나타낼 수 없어 글로만 고칠 수 있어요.").font(.caption).foregroundStyle(.orange)
                 }
             }
-            if case .failure(let e) = condition { Text(e.description).font(.caption).foregroundStyle(.red) }
+        }
+        if case .failure(let e) = condition { Text(e.description).font(.caption).foregroundStyle(.red) }
+        if mode != .always, let (_, f, _) = outcome, let dr = draft {
+            Text(f.explain(dr.when)).font(.caption.monospaced()).foregroundStyle(.secondary)
+        }
+        TextField(text: bind(\.check), prompt: Text("비우면 출구 자체만 점검")) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("상태 점검 대상")
+                Text("host:port 에 닿을 때만 그 출구를 써요").font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -390,66 +466,13 @@ struct RuleForm: View {
         }
     }
 
-    // MARK: 미리보기
-
-    private var preview: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("지금이라면").font(.headline)
-            if let d = draft, let s = m.status, let c = m.config {
-                let f = CLI.facts(s, c)
-                let o = c.paused ? Outcome.off : decide(d, facts: f)
-                Label(reasonText(d, o, facts: f, paused: c.paused), systemImage: icon(o))
-                    .foregroundStyle(color(o))
-                if !d.when.isAlways { Text(f.explain(d.when)).font(.caption.monospaced()).foregroundStyle(.secondary) }
-                // 가려짐: 이 규칙을 지금 자리에 둔 목록으로 따진다
-                let list: [Rule] = {
-                    var rs = c.rules
-                    if let i = rs.firstIndex(where: { $0.id == d.id }) { rs[i] = d } else { rs.append(d) }
-                    return rs
-                }()
-                let idx = list.firstIndex { $0.id == d.id } ?? list.count - 1
-                ForEach(shadowWarnings(list, index: idx, addresses: m.resolvedIPs), id: \.self) { w in
-                    Label(w, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
-                }
-                if let rs = s.rules.first(where: { $0.id == d.id }) {
-                    ForEach(rs.addresses.compactMap(\.note), id: \.self) { n in
-                        Label(n, systemImage: "shield.lefthalf.filled").font(.callout).foregroundStyle(.orange)
-                    }
-                }
-            } else {
-                Text("조건을 고치면 결과를 보여 드려요.").foregroundStyle(.secondary)
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: 680, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
-    }
-
-    private func icon(_ o: Outcome) -> String {
-        switch o {
-        case .route: return "arrow.right.circle.fill"
-        case .block: return "nosign"
-        case .system: return "arrow.uturn.right.circle"
-        case .next, .skip: return "arrow.down.circle"
-        case .off: return "circle"
-        }
-    }
-    private func color(_ o: Outcome) -> Color {
-        switch o {
-        case .route(let n, _): return Color.exit(n.hasPrefix("vpn") ? "vpn" : n)
-        case .block: return .red
-        default: return .secondary
-        }
-    }
-
     // MARK: 저장
 
     private var footer: some View {
         HStack {
-            if let o = original {
-                Button("규칙 지우기", role: .destructive) {
-                    Task { await m.remove(o.id); m.windowSelection = nil }
-                }
+            if original != nil {
+                Button("규칙 삭제…", role: .destructive) { confirmDelete = true }
+                    .buttonStyle(.borderless).foregroundStyle(.red)
             }
             if !problems.isEmpty {
                 Text(problems.joined(separator: " · ")).font(.caption).foregroundStyle(.red).lineLimit(2)
@@ -584,29 +607,37 @@ struct ProfileDetail: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Image(systemName: m.profileHere(name) ? "location.fill" : "location").foregroundStyle(m.profileHere(name) ? .green : .secondary)
-                Text(name).font(.title2.bold())
-                if m.profileHere(name) { Text("지금 여기").font(.caption.bold()).foregroundStyle(.green) }
+        Form {
+            Section {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle().fill(m.profileHere(name) ? Color.green : Color.secondary.opacity(0.45))
+                        Image(systemName: "location.fill").font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
+                    }.frame(width: 38, height: 38)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(name).font(.title3.bold())
+                        Text(m.profileHere(name) ? "지금 이 망에 있어요" : "지금 이 망이 아니에요").font(.callout).foregroundStyle(.secondary)
+                    }
+                }.padding(.vertical, 4)
             }
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
-                GridRow { Text("링크").foregroundStyle(.secondary); Text(Exits.label(profile.link)) }
-                GridRow { Text("게이트웨이").foregroundStyle(.secondary); Text(profile.gateway).monospaced() }
-                GridRow { Text("게이트웨이 MAC").foregroundStyle(.secondary); Text(profile.gatewayMac.isEmpty ? "(없음)" : profile.gatewayMac).monospaced() }
+            Section {
+                LabeledContent("링크", value: Exits.label(profile.link))
+                LabeledContent("게이트웨이") { Text(profile.gateway).monospaced() }
+                LabeledContent("게이트웨이 MAC") { Text(profile.gatewayMac.isEmpty ? "(없음)" : profile.gatewayMac).monospaced() }
+            } footer: {
+                Text("조건에 profile=\(name) 으로 쓰면, 이 링크가 이 게이트웨이(그리고 MAC)에 붙어 있을 때 참이 돼요.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Text("조건에 profile=\(name) 으로 쓰면, 이 링크가 이 게이트웨이(그리고 MAC)에 붙어 있을 때 참이 돼요.")
-                .font(.callout).foregroundStyle(.secondary)
-            if users.isEmpty {
-                Button("프로필 지우기", role: .destructive) { Task { await m.removeProfile(name) } }
-            } else {
-                Text("쓰는 규칙: " + users.map(\.title).joined(separator: ", ")).font(.callout)
-                Text("이 규칙들의 조건에서 빼야 지울 수 있어요.").font(.caption).foregroundStyle(.secondary)
+            Section {
+                if users.isEmpty {
+                    Button("프로필 삭제", role: .destructive) { Task { await m.removeProfile(name) } }
+                } else {
+                    LabeledContent("쓰는 규칙", value: users.map(\.title).joined(separator: ", "))
+                    Text("이 규칙들의 조건에서 빼야 지울 수 있어요.").font(.caption).foregroundStyle(.secondary)
+                }
             }
-            Spacer()
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .formStyle(.grouped)
     }
 }
 
