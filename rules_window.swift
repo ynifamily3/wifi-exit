@@ -16,7 +16,6 @@ struct RulesWindow: View {
     private var detailTitle: String {
         guard let sel = m.windowSelection else { return "규칙" }
         if sel == "new" { return "새 규칙" }
-        if sel == "new-remaining" { return "나머지 트래픽" }
         if sel.hasPrefix("rule:"), let r = rules.first(where: { "rule:" + $0.id == sel }) { return r.title }
         if sel.hasPrefix("profile:") { return String(sel.dropFirst(8)) }
         return "규칙"
@@ -26,7 +25,7 @@ struct RulesWindow: View {
         NavigationSplitView {
             List(selection: $m.windowSelection) {
                 Section("규칙 · 위에서부터") {
-                    ForEach(rules.filter { !$0.isRemaining }, id: \.id) { r in
+                    ForEach(rules, id: \.id) { r in
                         RuleListItem(rule: r, status: m.status?.rules.first { $0.id == r.id },
                                      shadowedBy: m.shadowedBy(r), dirty: m.drafts["rule:" + r.id]?.isDirty == true)
                             .tag("rule:" + r.id)
@@ -38,18 +37,9 @@ struct RulesWindow: View {
                     }
                     .onMove { from, to in
                         guard let i = from.first else { return }
-                        let id = rules.filter { !$0.isRemaining }[i].id
+                        let id = rules[i].id
                         let dest = to > i ? to - 1 : to
                         Task { await m.move(id, String(dest + 1)) }
-                    }
-                }
-                Section("기본 출구 · 개별 규칙 다음") {
-                    if let r = rules.first(where: \.isRemaining) {
-                        RuleListItem(rule: r, status: m.status?.rules.first { $0.id == r.id },
-                                     dirty: m.drafts["rule:" + r.id]?.isDirty == true)
-                            .tag("rule:" + r.id)
-                    } else {
-                        Label("나머지 트래픽 설정", systemImage: "network").tag("new-remaining")
                     }
                 }
                 Section("네트워크 프로필") {
@@ -75,8 +65,6 @@ struct RulesWindow: View {
             Group {
                 if let sel = m.windowSelection, sel.hasPrefix("rule:"), let i = rules.firstIndex(where: { "rule:" + $0.id == sel }) {
                     RuleForm(key: sel, original: rules[i], index: i).id(sel)
-                } else if m.windowSelection == "new-remaining" {
-                    RuleForm(key: "new-remaining", original: nil, index: rules.count).id("new-remaining")
                 } else if m.windowSelection == "new" {
                     RuleForm(key: "new", original: nil, index: rules.count).id("new")
                 } else if let sel = m.windowSelection, sel.hasPrefix("profile:"), let p = m.config?.profiles[String(sel.dropFirst(8))] {
@@ -89,6 +77,9 @@ struct RulesWindow: View {
             .navigationTitle(detailTitle)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
+                    Button { NSApp.activate(ignoringOtherApps: true); openWindow(id: "app-rules") } label: {
+                        Label("앱별 스플리팅", systemImage: "app.connected.to.app.below.fill")
+                    }.help("앱별 스플리팅")
                     Button { NSApp.activate(ignoringOtherApps: true); openWindow(id: "routes") } label: {
                         Label("라우팅 보기", systemImage: "point.3.connected.trianglepath.dotted")
                     }.help("라우팅 보기")
@@ -220,7 +211,6 @@ struct RuleForm: View {
 
     private var problems: [String] {
         var out: [String] = []
-        if targets.contains(Remaining.target) && targets != [Remaining.target] { out.append("나머지는 다른 대상과 섞을 수 없어요") }
         if targets.isEmpty { out.append("대상을 하나 이상 넣어 주세요") }
         let ck = d.check.trimmingCharacters(in: .whitespaces)
         if !ck.isEmpty && CheckTarget.parse(ck) == nil { out.append("점검 대상은 host:port (예: git.example.corp:443)") }
@@ -338,9 +328,7 @@ struct RuleForm: View {
     /// 초안을 준비한다. 고친 게 없는데 원본이 바뀌었으면 새 원본으로 다시 시작한다.
     private func syncDraft() {
         if let cur = m.drafts[key], cur.isDirty { return }
-        var draft = RuleDraft(original)
-        if key == "new-remaining" { draft.targets = [Remaining.target] }
-        m.drafts[key] = draft
+        m.drafts[key] = RuleDraft(original)
     }
 
     // MARK: 대상
@@ -348,21 +336,10 @@ struct RuleForm: View {
     private var targetError: String? {
         let t = newTarget.trimmingCharacters(in: .whitespaces)
         if t.isEmpty { return nil }
-        if t == Remaining.target { return "왼쪽의 나머지 트래픽 설정을 사용해 주세요" }
         return Target.parse(t) == nil ? "IPv4, IPv4/프리픽스(8–32), 도메인만 넣을 수 있어요" : nil
     }
 
     @ViewBuilder private var targetsEditor: some View {
-        if targets == [Remaining.target] {
-            Label("나머지 트래픽 모두", systemImage: "network")
-            Text("활성 개별 규칙이 맡지 않은 인터넷 연결에 마지막으로 적용해요. 내부망·VPN 연결용 주소는 기존 경로를 유지하고, 인터넷 IPv6는 우회를 막기 위해 차단해요.")
-                .font(.callout).foregroundStyle(.secondary)
-        } else {
-            hostTargetsEditor
-        }
-    }
-
-    @ViewBuilder private var hostTargetsEditor: some View {
         ForEach(targets, id: \.self) { t in
             let ips = m.resolvedIPs[t] ?? []
             HStack {
@@ -385,7 +362,7 @@ struct RuleForm: View {
     }
 
     private func addTarget() {
-        guard let (t, kind) = Target.parse(newTarget), kind != .remaining else { return }
+        guard let (t, _) = Target.parse(newTarget) else { return }
         if !targets.contains(t) { targets.append(t) }
         newTarget = ""
     }
@@ -469,12 +446,10 @@ struct RuleForm: View {
         if mode != .always, let (_, f, _) = outcome, let dr = draft {
             Text(f.explain(dr.when)).font(.caption.monospaced()).foregroundStyle(.secondary)
         }
-        if targets != [Remaining.target] {
-            TextField(text: bind(\.check), prompt: Text("비우면 출구 자체만 점검")) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("상태 점검 대상")
-                    Text("host:port 에 닿을 때만 그 출구를 써요").font(.caption).foregroundStyle(.secondary)
-                }
+        TextField(text: bind(\.check), prompt: Text("비우면 출구 자체만 점검")) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("상태 점검 대상")
+                Text("host:port 에 닿을 때만 그 출구를 써요").font(.caption).foregroundStyle(.secondary)
             }
         }
     }

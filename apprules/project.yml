@@ -1,6 +1,6 @@
-# Wi-Fi Exit 앱 규칙: 투명 프록시 시스템 확장과 그것을 담는 작은 앱.
+# Wi-Fi Exit 본 앱과 앱별 스플리팅 시스템 확장.
 # 팀 ID 는 build.sh 가 키체인의 Developer ID 인증서에서 읽어 TEAM_ID 로 넘긴다 (저장소에 적지 않는다).
-name: WifiExitAppRules
+name: WifiExit
 options:
   bundleIdPrefix: com.miel
   deploymentTarget:
@@ -11,21 +11,42 @@ settings:
     SWIFT_VERSION: "5"
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: YES
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: NO
 targets:
-  WifiExitAppRules:
+  WifiExit:
     type: application
     platform: macOS
-    sources: [App]
+    sources:
+      - ../app.swift
+      - ../rules_window.swift
+      - ../routes_window.swift
+      - ../outside.swift
+      - ../exit_reasons.swift
+      - ../ui_kit.swift
+      - ../shared.swift
+      - ../conditions.swift
+      - ../app_policy.swift
+      - ../app_identity.swift
+      - ../app_rules.swift
+      - path: ../icon/AppIcon.icns
+        buildPhase: resources
     info:
       path: App/Info.plist
       properties:
-        CFBundleName: Wi-Fi Exit 앱 규칙
-        CFBundleDisplayName: Wi-Fi Exit 앱 규칙
+        CFBundleName: Wi-Fi Exit
+        CFBundleDisplayName: Wi-Fi Exit
         CFBundlePackageType: APPL
         CFBundleShortVersionString: ${APP_VERSION}
         CFBundleVersion: ${APP_BUILD}
         LSMinimumSystemVersion: "15.2"
+        LSApplicationCategoryType: public.app-category.utilities
+        NSSystemExtensionUsageDescription: 선택한 앱의 TCP·UDP 연결을 지정한 네트워크로 중계합니다.
         LSUIElement: true
+        CFBundleIconFile: AppIcon
+        CFBundleURLTypes:
+          - CFBundleURLName: com.miel.WifiExit
+            CFBundleURLSchemes: [wifi-exit]
     entitlements:
       path: App/App.entitlements
       properties:
@@ -34,15 +55,20 @@ targets:
         com.apple.security.application-groups: ["${TEAM_ID}.com.miel.WifiExit.AppRules"]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.miel.WifiExit.AppRules
-        PRODUCT_NAME: WifiExitAppRules
+        PRODUCT_BUNDLE_IDENTIFIER: com.miel.WifiExit
+        PRODUCT_NAME: WifiExit
     dependencies:
       - target: AppRulesProxy
         embed: true
   AppRulesProxy:
     type: system-extension
     platform: macOS
-    sources: [Proxy]
+    sources:
+      - Proxy
+      - ../shared.swift
+      - ../conditions.swift
+      - ../app_policy.swift
+      - ../app_identity.swift
     info:
       path: Proxy/Info.plist
       properties:
@@ -59,9 +85,9 @@ targets:
       path: Proxy/Proxy.entitlements
       properties:
         com.apple.developer.networking.networkextension: [app-proxy-provider-systemextension]
+        com.apple.security.application-groups: ["${TEAM_ID}.com.miel.WifiExit.AppRules"]
         com.apple.security.app-sandbox: true
         com.apple.security.network.client: true
-        com.apple.security.application-groups: ["${TEAM_ID}.com.miel.WifiExit.AppRules"]
         # 결과 전달 1안: 엔진이 쓰는 상태 폴더를 읽기 전용으로 (A0 에서 확인)
         com.apple.security.temporary-exception.files.absolute-path.read-only: ["/Library/Application Support/WifiExit/state/"]
     settings:

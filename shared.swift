@@ -6,11 +6,7 @@ enum Paths {
     static let engine = "/Library/PrivilegedHelperTools/com.miel.WifiExit.engine"
     static let legacyHelper = "/Library/PrivilegedHelperTools/com.miel.WifiExit.helper"
     static let sudoers = "/etc/sudoers.d/wifiexit"     // sudoers.d 는 이름에 '.' 이 있으면 무시하므로 점 없이
-    #if WIFI_EXIT_TESTING
-    static let dir = NSTemporaryDirectory() + "wifi-exit-tests-\(ProcessInfo.processInfo.processIdentifier)"
-    #else
     static let dir = "/Library/Application Support/WifiExit"
-    #endif
     static let config = dir + "/config.json"           // root 만 쓴다. 바뀌면 데몬이 곧바로 적용
     static let lock = dir + "/.lock"
     static let stateDir = dir + "/state"               // 엔진이 쓰는 파일. 디렉터리를 나눠 설정 감시에 걸리지 않게 한다
@@ -27,13 +23,8 @@ enum Paths {
     static let daemonLabel = "ing.miel.wifi-exit"
     static let daemonPlist = "/Library/LaunchDaemons/ing.miel.wifi-exit.plist"
     static let anchor = "com.apple/wifi-exit"
-    #if WIFI_EXIT_TESTING
-    static let anchorFile = dir + "/anchor.pf"
-    static let resolverDir = dir + "/resolver"
-    #else
     static let anchorFile = "/etc/pf.anchors/wifi-exit"
     static let resolverDir = "/etc/resolver"
-    #endif
 }
 
 // MARK: - 설정 (config.json, v2)
@@ -61,8 +52,7 @@ struct Rule: Codable, Equatable {
     }
 
     /// 화면·CLI 에 보일 이름: 메모가 없으면 첫 대상.
-    var isRemaining: Bool { targets.contains(Remaining.target) }
-    var title: String { name.isEmpty ? (isRemaining ? "나머지 트래픽" : (targets.first ?? id)) : name }
+    var title: String { name.isEmpty ? (targets.first ?? id) : name }
     var exitsText: String { exits.isEmpty ? "출구 없음" : exits.map(Exits.label).joined(separator: " → ") }
 }
 
@@ -191,14 +181,14 @@ struct EngineConfig: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 2
         paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
-        rules = Remaining.ordered(try c.decodeIfPresent([Rule].self, forKey: .rules) ?? [])
+        rules = (try c.decodeIfPresent([Rule].self, forKey: .rules) ?? []).filter { !$0.targets.contains("remaining") }
         profiles = try c.decodeIfPresent([String: NetProfile].self, forKey: .profiles) ?? [:]
     }
 }
 
 // MARK: - 대상 검사
 
-enum TargetKind: String, Codable { case ip, cidr, domain, remaining }
+enum TargetKind: String, Codable { case ip, cidr, domain }
 
 enum Target {
     static func ipv4Octets(_ s: String) -> [UInt32]? {
@@ -245,7 +235,6 @@ enum Target {
     /// 대상 문자열을 정규화하고 종류를 돌려준다. 받을 수 없는 값이면 nil.
     static func parse(_ raw: String) -> (String, TargetKind)? {
         let s = raw.trimmingCharacters(in: .whitespaces).lowercased()
-        if s == Remaining.target { return (s, .remaining) }
         if isIPv4(s) { return (s, .ip) }
         if s.contains("/"), let c = normalizedCIDR(s) { return (c, .cidr) }
         if isDomain(s) { return (s, .domain) }
@@ -323,7 +312,7 @@ struct RuleStatus: Codable, Hashable, Identifiable {
     var reason: String         // 왜 그렇게 됐는지 한 줄
     var targets: [TargetStatus]
 
-    var title: String { name.isEmpty ? (targets.first?.kind == .remaining ? "나머지 트래픽" : (targets.first?.target ?? id)) : name }
+    var title: String { name.isEmpty ? (targets.first?.target ?? id) : name }
     var addresses: [AddressStatus] { targets.flatMap(\.addresses) }
     /// 이 규칙이 실제로 맡은 주소 (앞 규칙에 가려진 것 제외)
     var ownAddresses: [AddressStatus] { addresses.filter { $0.owner == nil } }

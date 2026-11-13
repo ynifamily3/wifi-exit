@@ -17,17 +17,35 @@ NOTARY_PROFILE="${WIFI_EXIT_NOTARY_PROFILE:-MenuShelf-notary}"
 NAME="Wi-Fi Exit"
 APP="build/$NAME.app"
 
+mkdir -p build
+swiftc -target arm64-apple-macosx15.2 -O -swift-version 5 -parse-as-library engine.swift events.swift shared.swift conditions.swift -o build/wifi-exitd
+codesign --force --options runtime --timestamp --sign "$IDENTITY" --identifier com.miel.WifiExit.engine build/wifi-exitd
+export TEAM_ID="${TEAM_ID:-$(print -r -- "$IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')}"
+export APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+export APP_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist)"
+command -v xcodegen >/dev/null || { echo "XcodeGen 필요: brew install xcodegen" >&2; exit 1; }
+(cd apprules && xcodegen generate --quiet)
+ARCHIVE="$PWD/apprules/build/WifiExit.xcarchive"
+EXPORT="$PWD/apprules/build/export"
+rm -rf "$ARCHIVE" "$EXPORT"
+xcodebuild -project apprules/WifiExit.xcodeproj -scheme WifiExit -configuration Release \
+  -destination 'generic/platform=macOS' -archivePath "$ARCHIVE" CODE_SIGNING_ALLOWED=NO archive > build/archive.log 2>&1 || { tail -80 build/archive.log; exit 1; }
+ARC="$ARCHIVE/Products/Applications/WifiExit.app"
+EXT="$ARC/Contents/Library/SystemExtensions/com.miel.WifiExit.AppRules.proxy.systemextension"
+mkdir -p "$ARC/Contents/Helpers"
+cp build/wifi-exitd "$ARC/Contents/Helpers/wifi-exitd"
+codesign -s - --force --options runtime --entitlements apprules/Proxy/Proxy.entitlements "$EXT"
+codesign -s - --force --options runtime --entitlements apprules/App/App.entitlements "$ARC"
+cat > build/export.plist <<P
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>method</key><string>developer-id</string><key>signingStyle</key><string>automatic</string><key>teamID</key><string>$TEAM_ID</string></dict></plist>
+P
+xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$EXPORT" \
+  -exportOptionsPlist build/export.plist -allowProvisioningUpdates > build/export.log 2>&1 || { tail -80 build/export.log; exit 1; }
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
-cp Info.plist "$APP/Contents/Info.plist"
-cp icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-swiftc -target arm64-apple-macosx15.2 -O -swift-version 5 -parse-as-library app.swift rules_window.swift routes_window.swift outside.swift exit_reasons.swift ui_kit.swift shared.swift conditions.swift remaining.swift -o "$APP/Contents/MacOS/WifiExit"
-swiftc -target arm64-apple-macosx15.2 -O -swift-version 5 -parse-as-library engine.swift events.swift shared.swift conditions.swift remaining.swift -o "$APP/Contents/Helpers/wifi-exitd"
-# 안쪽부터 서명한다. 타임스탬프 서버가 가끔 응답하지 않아 몇 번 다시 시도한다.
-sign() { for i in 1 2 3; do codesign --force --options runtime --timestamp --sign "$IDENTITY" "$@" && return 0; sleep 3; done; return 1; }
-sign --identifier com.miel.WifiExit.engine "$APP/Contents/Helpers/wifi-exitd"
-sign "$APP"
-codesign --verify --strict --verbose=2 "$APP"
+ditto "$EXPORT/WifiExit.app" "$APP"
+codesign --verify --strict --deep --verbose=2 "$APP"
+python3 tests/package_check.py "$APP"
 
 notarize=0; install=0
 for a in "$@"; do

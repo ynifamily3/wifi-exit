@@ -482,8 +482,14 @@ extension Condition {
 /// 대상 a 가 대상 b 에 포함되는지 (같은 값, 또는 IP/망이 망 안에).
 func targetCovered(_ a: String, by b: String) -> Bool {
     if a == b { return true }
-    guard let lhs = IPv4Prefix(a), let rhs = IPv4Prefix(b) else { return false }
-    return rhs.contains(lhs)
+    guard b.contains("/"), let bn = Target.normalizedCIDR(b) else { return false }
+    let parts = bn.split(separator: "/")
+    guard let net = Target.ipv4Number(String(parts[0])), let p = UInt32(parts[1]) else { return false }
+    let mask: UInt32 = p == 32 ? ~0 : ~(~UInt32(0) >> p)
+    let aIP = String(a.split(separator: "/")[0])
+    let aP = a.contains("/") ? UInt32(a.split(separator: "/")[1]) ?? 32 : 32
+    guard let an = Target.ipv4Number(aIP), aP >= p else { return false }
+    return an & mask == net
 }
 
 /// rules[index] 의 대상 중 앞 규칙이 먼저 잡는 것. addresses: 도메인 → 지금 풀린 IP (상태 파일에서).
@@ -491,11 +497,10 @@ func targetCovered(_ a: String, by b: String) -> Bool {
 func shadowWarnings(_ rules: [Rule], index: Int, addresses: [String: [String]]) -> [String] {
     guard rules.indices.contains(index) else { return [] }
     let me = rules[index]
-    if me.isRemaining { return [] }
     var out: [String] = []
     for t in me.targets {
         let mine = Target.parse(t)?.1 == .domain ? (addresses[t] ?? []) : [t]
-        for (j, r) in rules.enumerated() where j < index && r.enabled && !r.isRemaining {
+        for (j, r) in rules.enumerated() where j < index && r.enabled {
             let sometimes = !r.when.isAlways || r.elseAction == "next"
             let hit: String?
             if r.targets.contains(where: { targetCovered(t, by: $0) }) {

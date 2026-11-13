@@ -2,8 +2,9 @@
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
-swiftc -swift-version 5 -D WIFI_EXIT_TESTING -parse-as-library engine.swift events.swift shared.swift conditions.swift remaining.swift tests/PolicyTests.swift -o build/policy-tests
-build/policy-tests
-/sbin/pfctl -nf /tmp/wifi-exit-policy-test.pf > build/pf-parse.log 2>&1 || { cat build/pf-parse.log; exit 1; }
-/sbin/pfctl -nf /tmp/wifi-exit-policy-test-logging.pf >> build/pf-parse.log 2>&1 || { cat build/pf-parse.log; exit 1; }
-echo "PASS: macOS pf syntax (logging on/off)"
+swiftc -target arm64-apple-macosx15.2 -swift-version 5 -parse-as-library shared.swift conditions.swift app_policy.swift app_identity.swift apprules/Proxy/Relays.swift tests/SplitTests.swift -o build/split-tests
+test_app="${SPLIT_TEST_APP:-$PWD/build/Wi-Fi Exit.app}"
+if [[ -d "$test_app" ]]; then build/split-tests "$test_app"; else build/split-tests; fi
+swiftc -target arm64-apple-macosx15.2 -swift-version 5 -parse-as-library -typecheck apprules/Proxy/AppRuleProvider.swift apprules/Proxy/Relays.swift shared.swift conditions.swift app_policy.swift app_identity.swift
+
+swiftc -target arm64-apple-macosx15.2 -swift-version 5 -parse-as-library -typecheck tests/NetworkProbe.swift

@@ -428,12 +428,21 @@ final class AppModel: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Wi-Fi Exit 설정을 모두 지울까요?"
-        alert.informativeText = "고정 라우트, pf 차단 규칙, /etc/resolver 파일, 엔진과 데몬, sudoers 규칙을 지우고 앱을 끝냅니다. 등록한 호스트는 그 뒤로 평소 경로(유선·VPN)로 나갑니다."
+        alert.informativeText = "앱별 스플리팅의 프록시 구성·확장·앱 규칙과 호스트의 고정 라우트·pf 규칙·DNS 설정·엔진을 정리합니다. 연결은 평소 시스템 경로로 돌아갑니다. 확장 제거는 재부팅 때 완료될 수 있습니다."
         alert.addButton(withTitle: "모두 지우기")
         alert.addButton(withTitle: "취소")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         busy = true
-        let r = await background { Engine.run(["uninstall"]) }
+        do {
+            try await SplitControl.disable(remove: true)
+            if SplitControl.installed() != "등록 안 됨" {
+                let _: Bool = await withCheckedContinuation { continuation in
+                    _ = SplitExtensionRequest(activate: false, update: { [weak self] text in self?.message = text }) { ready, _ in continuation.resume(returning: ready) }
+                }
+            }
+            UserDefaults.standard.removeObject(forKey: "appSplitConfig")
+        } catch { busy = false; message = "앱별 스플리팅을 정리하지 못했어요: \(error.localizedDescription)"; return }
+        let r = await background { Engine.installedAtAll() ? Engine.run(["uninstall"]) : ShellResult(code: 0, out: "", err: "") }
         busy = false
         guard r.ok else { message = "지우지 못했어요: \(r.message)"; return }
         try? LoginItem.set(false)
@@ -458,7 +467,7 @@ enum Entry {
 
 enum CLI {
     static let commands: Set<String> = ["status", "list", "ls", "add", "set", "move", "mv", "exits", "profile", "profiles", "explain", "why", "simulate", "sim", "diag", "edit", "health", "watch", "view", "rm", "remove", "on", "off", "pause", "resume",
-                                        "resolve", "apply", "log", "selftest", "install", "uninstall", "login", "help", "-h", "--help"]
+                                        "apps", "resolve", "apply", "log", "selftest", "install", "uninstall", "login", "help", "-h", "--help"]
 
     static func shouldHandle(_ argv: [String]) -> Bool {
         if let a0 = argv.first, (a0 as NSString).lastPathComponent == "wifi-exit" { return true }
@@ -473,7 +482,7 @@ enum CLI {
       wifi-exit list [--json]            규칙 목록 (위에서부터 적용, 한 주소에는 처음 맞는 규칙 하나)
       wifi-exit exits                    지금 쓸 수 있는 출구
       wifi-exit add <대상> [--via 출구,…] [--else block|system|next] [메모]
-                                         대상 = IPv4 | IPv4/프리픽스 | 도메인 | remaining(나머지 트래픽). 이미 있으면 켜고 바꾼다
+                                         대상 = IPv4 | IPv4/프리픽스 | 도메인. 이미 있으면 켜고 바꾼다
                                          출구 기본값 wifi, 없을 때 기본값 block(차단)
       wifi-exit set <대상|id> [--via 출구,…] [--else …] [--when 조건] [--name 메모]
                                          add 도 --when 을 받는다. 조건이 안 맞으면 그 규칙은 건너뛴다
@@ -481,6 +490,7 @@ enum CLI {
       wifi-exit profile [add <이름> [wifi|wired|tether] | rm <이름>]
                                          지금 붙은 망(게이트웨이 IP + MAC)을 이름 붙여 저장한다
       wifi-exit edit [대상|id]            규칙 편집 창을 연다
+      wifi-exit apps [edit|status|add|rm|on|off|enable|disable|remove]  앱별 스플리팅
       wifi-exit view                     라우팅 보기 창: 연결이 앱 → 규칙 → 출구로 흐르는 모습
       wifi-exit watch [--json]           규칙 대상으로 가는 새 연결을 실시간으로 한 줄씩 (Ctrl-C 로 끝).
                                          보는 동안만 엔진이 pf 기록을 켠다
@@ -554,6 +564,8 @@ enum CLI {
             return simulate(rest)
         case "watch":
             return watch(json: json)
+        case "apps":
+            AppSplitCLI.run(rest)
         case "view":
             return sh("/usr/bin/open", ["wifi-exit://routes"]).ok ? 0 : fail("라우팅 보기 창을 열지 못했어요")
         case "health":
@@ -604,10 +616,7 @@ enum CLI {
             print("엔진과 데몬을 설치했어요.")
             return status(json: false, listOnly: false)
         case "uninstall":
-            guard Engine.installedAtAll() else { print("설치돼 있지 않아요."); return 0 }
-            let r = Engine.run(["uninstall"])
-            if r.ok { print(r.out, terminator: ""); return 0 }
-            return shInteractive("/usr/bin/sudo", [Paths.engine, "uninstall"]) == 0 ? 0 : 1
+            AppSplitCLI.run(["remove"], uninstallAll: true)
         case "login":
             return login(rest.first)
         default:
@@ -998,6 +1007,12 @@ struct WifiExitApp: App {
         .defaultSize(width: 900, height: 620)
         .handlesExternalEvents(matching: ["rules"])
 
+        Window("앱별 스플리팅", id: "app-rules") {
+            AppRulesView().onOpenURL { _ in NSApp.activate(ignoringOtherApps: true) }
+        }
+        .defaultSize(width: 850, height: 640)
+        .handlesExternalEvents(matching: ["app-rules"])
+
         Window("라우팅 보기", id: "routes") {
             RoutesWindow().environmentObject(model)
                 .onOpenURL { _ in NSApp.activate(ignoringOtherApps: true) }
@@ -1060,7 +1075,7 @@ struct ContentView: View {
             Toggle("", isOn: Binding(get: { !(m.status?.paused ?? false) }, set: { on in Task { await m.setPaused(!on) } }))
                 .toggleStyle(.switch).labelsHidden().controlSize(.small)
                 .disabled(!m.engineReady || m.busy)
-                .help("Wi-Fi Exit 켜기 (끄면 일시정지: 등록한 대상도 평소 경로로)")
+                .help("호스트 규칙 켜기 (끄면 등록한 호스트도 평소 경로로)")
         }
         .padding(.horizontal, 2)
     }
@@ -1185,6 +1200,10 @@ struct ContentView: View {
             Divider().padding(.bottom, 4)
             MenuRow(title: "규칙 편집…", shortcut: "⌘,") { openRules(nil) }
                 .keyboardShortcut(",", modifiers: .command)
+            MenuRow(title: "앱별 스플리팅…", shortcut: "") {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "app-rules")
+            }
             MenuRow(title: "라우팅 보기…", shortcut: "⌘R") {
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "routes")
