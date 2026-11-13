@@ -66,7 +66,7 @@ final class OutsideSampler {
                 }
                 continue
             }
-            guard !seen.contains(key), !first, !skip.contains(dst) else { continue }
+            guard !seen.contains(key), !first, !skip.contains(where: { $0 == dst || targetCovered(dst, by: $0) }) else { continue }
             // process:pid 칸은 이름에 빈칸이 들어갈 수 있다 ("Claude Helper:3750"): ':숫자' 로 끝나는 칸까지 붙인다
             var procTokens: [Substring] = []
             for tok in f[10...] {

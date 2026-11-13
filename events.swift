@@ -153,7 +153,7 @@ final class EventHub {
                 // "ALL tcp 192.168.0.10:65395 -> 1.0.0.1:443   ESTABLISHED:ESTABLISHED" (나가는 연결만)
                 let f = line.split(separator: " ", omittingEmptySubsequences: true)
                 guard f.count >= 6, f[3] == "->", let (src, sport) = hostPort(f[2]), let (dst, dport) = hostPort(f[4]),
-                      let l = passFor[dst] else { continue }
+                      let l = passFor[dst] ?? passFor.first(where: { targetCovered(dst, by: $0.key) })?.value else { continue }
                 let proto = String(f[1])
                 let st = String(f[5])
                 let ev = ConnEvent(t: 0, act: "pass", iface: l.allow ?? "", proto: proto, src: src, sport: sport, dst: dst, dport: dport,

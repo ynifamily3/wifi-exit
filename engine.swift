@@ -36,8 +36,19 @@ let MARK = "# managed by WifiExit"
 
 struct Out { let code: Int32; let out: String; let err: String; var ok: Bool { code == 0 } }
 
+#if WIFI_EXIT_TESTING
+enum TestHooks {
+    static var run: ((String, [String]) -> Out)?
+    static var net: NetSnapshot?
+}
+#endif
+
 @discardableResult
 func run(_ path: String, _ args: [String]) -> Out {
+    #if WIFI_EXIT_TESTING
+    if let hook = TestHooks.run { return hook(path, args) }
+    fatalError("Tests must intercept every command")
+    #else
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
@@ -52,6 +63,7 @@ func run(_ path: String, _ args: [String]) -> Out {
     let outData = o.fileHandleForReading.readDataToEndOfFile()
     g.wait(); done.wait()
     return Out(code: p.terminationStatus, out: String(decoding: outData, as: UTF8.self), err: String(decoding: errData, as: UTF8.self))
+    #endif
 }
 
 func now() -> Int { Int(Date().timeIntervalSince1970) }
@@ -115,11 +127,16 @@ func withLock<T>(_ body: () -> T) -> T {
 // MARK: - 설정
 
 func loadConfig() -> EngineConfig { readJSON(Paths.config, EngineConfig.self) ?? EngineConfig() }
-func saveConfig(_ c: EngineConfig) { writeJSON(c, Paths.config) }
+func saveConfig(_ c: EngineConfig) {
+    if let why = Remaining.validation(c.rules) { die(why) }
+    var ordered = c; ordered.rules = Remaining.ordered(c.rules)
+    writeJSON(ordered, Paths.config)
+}
 
 func newRuleID() -> String { String(UUID().uuidString.prefix(8)).lowercased() }
 
 func validRule(_ r: Rule, profiles: Set<String>) -> String? {
+    if let why = Remaining.validation([r]) { return why }
     if let why = r.when.validate(profiles: profiles) { return "조건: \(why)" }
     if !r.exits.allSatisfy(Exits.isValid) { return "알 수 없는 출구: \(r.exits.filter { !Exits.isValid($0) }.joined(separator: ", "))" }
     if !Exits.elseActions.contains(r.elseAction) { return "알 수 없는 else: \(r.elseAction)" }
@@ -158,6 +175,9 @@ struct NetSnapshot {
 }
 
 func readNet() -> NetSnapshot {
+    #if WIFI_EXIT_TESTING
+    if let net = TestHooks.net { return net }
+    #endif
     let kinds = interfaceKinds()
     let wifiName = kinds.first { $0.value.type == (kSCNetworkInterfaceTypeIEEE80211 as String) }?.key ?? "en0"
     var exits: [ExitInfo] = []
@@ -272,7 +292,18 @@ func routeGet(_ dest: String) -> [String: String] {
 
 // MARK: - 라우트
 
-struct RouteEntry { let dest: String; let gateway: String; let flags: String; let netif: String }
+struct RouteEntry {
+    let dest: String; let gateway: String; let flags: String; let netif: String
+    var prefix: IPv4Prefix? {
+        guard dest != "default" else { return nil }
+        let parts = dest.split(separator: "/")
+        let octets = parts[0].split(separator: ".")
+        guard (1...4).contains(octets.count) else { return nil }
+        let address = (octets.map(String.init) + Array(repeating: "0", count: 4 - octets.count)).joined(separator: ".")
+        let bits = parts.count == 2 ? String(parts[1]) : String(flags.contains("H") ? 32 : octets.count * 8)
+        return IPv4Prefix(address + "/" + bits)
+    }
+}
 
 func routeTable() -> [RouteEntry] {
     run("/usr/sbin/netstat", ["-rn", "-f", "inet"]).out.split(separator: "\n").compactMap { line in
@@ -310,7 +341,7 @@ struct RouteSpec: Hashable {
         let parts = dest.split(separator: "/")
         var t = String(parts[0])
         while t.hasSuffix(".0") { t.removeLast(2) }
-        return ["\(t)/\(parts[1])", t]
+        return [dest, "\(t)/\(parts[1])", t]
     }
 }
 
@@ -354,11 +385,19 @@ func pfTargetAddresses(_ target: String) -> [String] {
 }
 
 /// 앵커에 올라가 있는 규칙: 주소 → 허용한 인터페이스 (nil = 모든 곳에서 막음)
+func displayedPFTarget(_ line: String) -> String? {
+    if line.hasSuffix(" inet6 all") { return "::/0" }
+    if line.hasSuffix(" inet all") { return "0.0.0.0/0" }
+    guard let r = line.range(of: " to ") else { return nil }
+    let target = line[r.upperBound...].split(separator: " ").first.map(String.init) ?? ""
+    if target == "any" { return line.contains(" inet6 ") ? "::/0" : "0.0.0.0/0" }
+    return target
+}
+
 func pfRules() -> [String: String?] {
     var out: [String: String?] = [:]
     for line in run("/sbin/pfctl", ["-a", Paths.anchor, "-s", "rules"]).out.split(separator: "\n") {
-        guard !line.hasPrefix("pass"), let r = line.range(of: " to ") else { continue }   // 기록용 통과 줄은 빼고
-        let target = line[r.upperBound...].split(separator: " ").first.map(String.init) ?? ""
+        guard line.hasPrefix("block"), let target = displayedPFTarget(String(line)) else { continue }
         let allow: String? = line.range(of: " on ! ").map { o in line[o.upperBound...].split(separator: " ").first.map(String.init) ?? "" }
         for addr in pfTargetAddresses(target) where out[addr] == nil { out[addr] = .some(allow) }
     }
@@ -373,35 +412,66 @@ func pfLoad() -> Bool {
 }
 
 /// 한 줄 = (규칙 id, 허용 인터페이스 또는 nil, IPv4 목록, IPv6 목록). 규칙 순서대로.
-struct PFGroup { let rule: String; let allow: String?; let v4: [String]; let v6: [String] }
+struct PFGroup { let rule: String; let allow: String?; let v4: [String]; let v6: [String]; var remaining = false; var system = false }
 
-func pfWrite(_ groups: [PFGroup]) {
+/// Pure renderer, also checked without changing the host firewall.
+func renderPF(_ groups: [PFGroup], logging: Bool, probes: [(String, UInt16)] = []) -> (String, [PFLine]) {
     var text = MARK + "\n"
     var map: [PFLine] = []
-    // watch 중이면 연결 시작을 기록한다: 고른 출구로 나가는 첫 패킷(통과, keep state 라 연결마다 한 번)과 막힌 패킷
-    let logging = FileManager.default.fileExists(atPath: Paths.logging)
     let lg = logging ? "log (user) " : ""
+    let hasRemaining = groups.contains { $0.remaining }
     func add(_ line: String, _ l: PFLine) { text += line + "\n"; map.append(l) }
-    // 주소마다 한 줄: 규칙별 카운터가 곧 주소별 카운터가 된다 (selftest 판정에 쓴다)
-    for g in groups {
-        let on = g.allow.map { "on ! \($0) " } ?? ""
-        for (fam, addrs) in [("inet", g.v4), ("inet6", g.v6)] {
-            for a in addrs {
-                if logging, let al = g.allow {
-                    add("pass out \(lg)quick on \(al) \(fam) proto tcp from any to \(a) flags S/SA keep state", PFLine(addr: a, rule: g.rule, kind: "pass", allow: al))
-                    add("pass out \(lg)quick on \(al) \(fam) proto udp from any to \(a) keep state", PFLine(addr: a, rule: g.rule, kind: "pass", allow: al))
-                }
-                add("block return out \(lg)quick \(on)\(fam) from any to \(a)", PFLine(addr: a, rule: g.rule, kind: "block", allow: g.allow))
+    // Only engine-owned TCP probes may bypass the final rule. User traffic to the same
+    // servers still follows the selected exit. IP_BOUND_IF chooses each probe's interface.
+    if hasRemaining {
+        for (ip, port) in probes where !groups.contains(where: { !$0.remaining && ($0.v4 + $0.v6).contains { $0 == ip || targetCovered(ip, by: $0) } }) {
+            add("pass out quick inet proto tcp from any to \(ip) port \(port) user root flags S/SA keep state",
+                PFLine(addr: ip, rule: "", kind: "probe", allow: nil))
+            if port == 53 {
+                add("pass out quick inet proto udp from any to \(ip) port 53 user root keep state",
+                    PFLine(addr: ip, rule: "", kind: "probe", allow: nil))
             }
         }
     }
+    for g in groups {
+        if g.remaining {
+            for ip in Remaining.localIPv6 {
+                add("pass out quick inet6 from any to \(ip)", PFLine(addr: ip, rule: "", kind: "local", allow: nil))
+            }
+        }
+        for (fam, addrs) in [("inet", g.v4), ("inet6", g.v6)] {
+            for a in addrs {
+                if g.system {
+                    add("pass out quick \(fam) from any to \(a)", PFLine(addr: a, rule: g.rule, kind: "system", allow: nil))
+                    continue
+                }
+                // Explicit rules get a terminal pass before the final IPv6 block.
+                // Remaining IPv6 fails closed until the engine supports IPv6 route pinning.
+                if let al = g.allow, !(g.remaining && fam == "inet6"), logging || hasRemaining {
+                    add("pass out \(lg)quick on \(al) \(fam) proto tcp from any to \(a) flags S/SA keep state", PFLine(addr: a, rule: g.rule, kind: "pass", allow: al))
+                    add("pass out \(lg)quick on \(al) \(fam) proto udp from any to \(a) keep state", PFLine(addr: a, rule: g.rule, kind: "pass", allow: al))
+                    if hasRemaining {
+                        add("pass out quick on \(al) \(fam) from any to \(a)", PFLine(addr: a, rule: g.rule, kind: "other", allow: al))
+                    }
+                }
+                let on = g.remaining && fam == "inet6" ? "" : (g.allow.map { "on ! \($0) " } ?? "")
+                add("block return out \(lg)quick \(on)\(fam) from any to \(a)", PFLine(addr: a, rule: g.rule, kind: "block", allow: g.remaining && fam == "inet6" ? nil : g.allow))
+            }
+        }
+    }
+    return (text, map)
+}
+
+func pfWrite(_ groups: [PFGroup]) {
+    let probes: [(String, UInt16)] = [("1.1.1.1", 443)] + readNet().exits.compactMap { e in e.dns.first.map { ($0, UInt16(53)) } }
+    let (text, map) = renderPF(groups, logging: FileManager.default.fileExists(atPath: Paths.logging), probes: probes)
     writeJSON(map, Paths.pfMap)
     let old = try? String(contentsOfFile: Paths.anchorFile, encoding: .utf8)
     if old != text { writeAtomic(text.data(using: .utf8)!, Paths.anchorFile) }
     pfEnsure()
     // 다시 올리면 규칙 카운터가 0 이 되므로, 파일이 바뀌었거나 시스템이 pf.conf 를 다시 읽어 앵커가 비었을 때만 올린다.
     var want: [String: String?] = [:]
-    for g in groups { for a in g.v4 + g.v6 where want[a] == nil { want[a] = .some(g.allow) } }
+    for g in groups where !g.system { for a in g.v4 + g.v6 where want[a] == nil { want[a] = .some(g.remaining && a.contains(":") ? nil : g.allow) } }
     let loaded = pfRules()
     // 표로 묶여 올라가 있으면(이전 버전) 한 번 다시 올려 주소별 줄로 바꾼다
     let tabled = run("/sbin/pfctl", ["-a", Paths.anchor, "-s", "rules"]).out.contains("<__automatic")
@@ -518,6 +588,7 @@ func healthRound() -> Bool {
     let net = readNet(), config = loadConfig(), ov = healthOverrides()
     let old = readJSON(Paths.health, HealthDB.self) ?? HealthDB()
     let pf = pfRules()
+    let pfMap = readJSON(Paths.pfMap, [PFLine].self) ?? []
     let lock = NSLock(), g = DispatchGroup()
     var exitRes: [String: (Bool, Int?, String, Bool)] = [:]
     var ruleRes: [String: (Bool, Int?, String, Bool)] = [:]
@@ -528,8 +599,12 @@ func healthRound() -> Bool {
         if let d = e.dns.first { targets.append((d, 53)) }
         if e.name != "vpn" { targets.append(("1.1.1.1", 443)) }
         targets = targets.filter { t in
-            guard let allow = pf[t.0] else { return true }
-            return allow == e.iface
+            let entries = pf.filter { $0.key == t.0 || targetCovered(t.0, by: $0.key) }
+            let explicit = pfMap.first {
+                $0.kind == "block" && ($0.addr == t.0 || targetCovered(t.0, by: $0.addr))
+            }
+            if let explicit, config.rules.first(where: { $0.id == explicit.rule })?.isRemaining == true { return true }
+            return entries.isEmpty || entries.values.allSatisfy { $0 == e.iface }
         }
         let forced = forcedDown(e, ov)
         let tgs = targets
@@ -568,7 +643,7 @@ func healthRound() -> Bool {
             DispatchQueue.global().async {
                 var res: (Bool, Int?, String, Bool)
                 if forced { res = (false, nil, "시험: 실패로 둠", true) }
-                else if let ip, let allow = pf[ip], allow != e.iface {
+                else if let ip, pf.contains(where: { ($0.key == ip || targetCovered(ip, by: $0.key)) && $0.value != e.iface }) {
                     // 우리 pf 규칙이 이 출구에서 막는 주소: pf 가 돌려주는 RST 를 "닿음"으로 착각하지 않게 보내 보지 않는다
                     res = (false, nil, "\(c) — 이 출구에서는 규칙이 막는 주소", false)
                 }
@@ -721,11 +796,13 @@ func apply(forceResolve: Bool = false) -> EngineStatus {
     }
     writeJSON(db, Paths.resolved)
 
+    var remainingV4: [String] = []
     func addresses(of target: String) -> [String] {
         guard let (t, k) = Target.parse(target) else { return [] }
         switch k {
         case .ip, .cidr: return [t]
         case .domain: return (db.domains[t] ?? [:]).keys.sorted()
+        case .remaining: return remainingV4 + ["::/0"]
         }
     }
 
@@ -737,6 +814,25 @@ func apply(forceResolve: Bool = false) -> EngineStatus {
     var routes: [RouteSpec] = []
     for r in config.rules {
         guard let dec = decisions[r.id] else { continue }
+        if r.isRemaining {
+            // Reserve earlier rule destinations, local networks, VPN transports, DNS pins and
+            // host routes owned by other software. Never replace the system default route.
+            let connected = net.exits.compactMap { e -> String? in
+                guard e.name != "vpn", let ip = Target.ipv4Number(e.ip),
+                      let mask = Target.ipv4Number(net.masks[e.iface] ?? "") else { return nil }
+                let bits = mask.nonzeroBitCount
+                guard bits > 0, mask == IPv4Prefix.mask(bits) else { return nil }
+                return IPv4Prefix(ip & mask, bits).text
+            }
+            let foreign = table.filter { entry in
+                !entry.flags.contains("I") && !oldRoutes.contains { $0.netstatNames.contains(entry.dest) }
+                    && !dnsPins.contains { $0.netstatNames.contains(entry.dest) }
+            }
+            let fixedHosts = foreign.filter { $0.flags.contains("S") && $0.prefix?.length == 32 }.compactMap { $0.prefix?.text }
+            let networks = foreign.filter { !$0.flags.contains("H") }.compactMap { $0.prefix?.text }
+            remainingV4 = Remaining.prefixes(excluding: Array(owner.keys) + Array(protected)
+                + fixedHosts + dnsPins.map(\.dest) + connected, overriding: networks)
+        }
         switch dec { case .off, .next, .skip: continue; default: break }   // 뒤 규칙에 넘긴다
         var v4: [String] = [], v6: [String] = []
         for t in r.targets {
@@ -752,11 +848,16 @@ func apply(forceResolve: Bool = false) -> EngineStatus {
         }
         switch dec {
         case .route(_, let e):
-            groups.append(PFGroup(rule: r.id, allow: e.iface, v4: v4, v6: v6))
+            groups.append(PFGroup(rule: r.id, allow: e.iface, v4: v4, v6: v6, remaining: r.isRemaining))
             routes += v4.map { RouteSpec($0.contains("/") ? "net" : "host", $0, gateway: e.gateway, iface: e.iface) }
         case .block:
-            groups.append(PFGroup(rule: r.id, allow: nil, v4: v4, v6: v6))
-        default: break                                 // system: 주소만 차지하고 손대지 않는다
+            groups.append(PFGroup(rule: r.id, allow: nil, v4: v4, v6: v6, remaining: r.isRemaining))
+        case .system:
+            // IPv4 was subtracted from remaining prefixes; explicitly preserve IPv6 too.
+            if config.rules.contains(where: { $0.isRemaining && ["route", "block"].contains(decisions[$0.id]?.word ?? "") }) {
+                groups.append(PFGroup(rule: r.id, allow: nil, v4: [], v6: v6, system: true))
+            }
+        default: break
         }
     }
     routes += dnsPins.filter { p in !routes.contains { $0.dest == p.dest } }
@@ -765,9 +866,9 @@ func apply(forceResolve: Bool = false) -> EngineStatus {
     // 4) 차단 규칙 — 출구가 있든 없든 항상
     let before = pfRules()
     pfWrite(groups)
-    for g in groups {
-        for a in g.v4 where before[a] == nil { run("/sbin/pfctl", ["-q", "-k", "0.0.0.0/0", "-k", a]) }   // 이미 열린 연결 끊기
-        for a in g.v6 where before[a] == nil { run("/sbin/pfctl", ["-q", "-k", "::/0", "-k", a]) }
+    for g in groups where !g.system {
+        for a in g.v4 where before[a] != .some(g.allow) { run("/sbin/pfctl", ["-q", "-k", "0.0.0.0/0", "-k", a]) }   // 이미 열린 연결 끊기
+        for a in g.v6 where before[a] != .some(g.remaining ? nil : g.allow) { run("/sbin/pfctl", ["-q", "-k", "::/0", "-k", a]) }
     }
 
     // 5) 라우트
@@ -803,7 +904,7 @@ func apply(forceResolve: Bool = false) -> EngineStatus {
                 switch dec {
                 case .route(_, let e):
                     pinned = !isV6 && routeOK(RouteSpec(a.contains("/") ? "net" : "host", a, gateway: e.gateway, iface: e.iface), table: table)
-                    blocked = pf[a] == .some(.some(e.iface))
+                    blocked = pf[a] == .some(r.isRemaining && isV6 ? nil : .some(e.iface))
                 case .block:
                     blocked = pf[a] == .some(nil)
                 default: break
@@ -811,7 +912,7 @@ func apply(forceResolve: Bool = false) -> EngineStatus {
                 let own = owner[a]
                 return AddressStatus(
                     ip: a,
-                    interface: isV6 ? "" : (routeGet(String(a.split(separator: "/")[0]))["interface"] ?? ""),
+                    interface: isV6 ? "" : (r.isRemaining ? (pinned ? iface ?? "" : "") : (routeGet(String(a.split(separator: "/")[0]))["interface"] ?? "")),
                     pinned: pinned, blocked: blocked,
                     owner: own != nil && own != r.id ? own : nil,
                     note: excluded[a])
@@ -873,7 +974,7 @@ func takeFlags(_ args: [String]) -> (via: [String]?, els: String?, when: Conditi
             guard i + 1 < args.count else { die("--targets 뒤에 대상 목록 (쉼표로)", code: 2) }
             var ts: [String] = []
             for raw in args[i + 1].split(separator: ",") {
-                guard let (t, _) = Target.parse(String(raw)) else { die("IPv4, IPv4/프리픽스(8–32), 도메인만 넣을 수 있어요: '\(raw)'", code: 2) }
+                guard let (t, _) = Target.parse(String(raw)) else { die("IPv4, IPv4/프리픽스(8–32), 도메인 또는 remaining을 넣어 주세요: '\(raw)'", code: 2) }
                 if !ts.contains(t) { ts.append(t) }
             }
             guard (1...50).contains(ts.count) else { die("대상은 1–50개", code: 2) }
@@ -891,7 +992,7 @@ func cmdAdd(_ args: [String]) {
     let forceNew = args.contains("--new")          // 같은 대상이 있어도 새 규칙으로 (편집 창의 "새 규칙")
     let f = takeFlags(args.filter { $0 != "--new" })
     guard let raw = f.rest.first else { die("사용법: add <대상> [--via 출구,…] [--else block|system|next] [메모]", code: 2) }
-    guard let (t, _) = Target.parse(raw) else { die("IPv4, IPv4/프리픽스(8–32), 도메인만 넣을 수 있어요: '\(raw)'") }
+    guard let (t, _) = Target.parse(raw) else { die("IPv4, IPv4/프리픽스(8–32), 도메인 또는 remaining을 넣어 주세요: '\(raw)'") }
     let note = f.name ?? cleanNote(f.rest.dropFirst().joined(separator: " "))
     withLock {
         var c = loadConfig()
@@ -899,7 +1000,7 @@ func cmdAdd(_ args: [String]) {
         if let ck = f.check ?? nil, let h = CheckTarget.parse(ck)?.host, (f.targets ?? [t]).contains(h) {
             die("점검 대상은 이 규칙의 대상과 다른 곳이어야 해요 (보호하는 주소를 피하려는 출구로 보내지 않으려고)")
         }
-        if !forceNew, let i = findRule(c, t) {
+        if (!forceNew || t == Remaining.target), let i = findRule(c, t) {
             c.rules[i].enabled = true
             if !note.isEmpty { c.rules[i].name = note }
             if let v = f.via { c.rules[i].exits = v }
@@ -950,7 +1051,8 @@ func cmdMove(_ key: String, _ where_: String) {
     withLock {
         var c = loadConfig()
         guard let i = findRule(c, key) else { die("등록되지 않은 대상: '\(key)'") }
-        let last = c.rules.count - 1
+        if c.rules[i].isRemaining { die("나머지 트래픽은 항상 개별 규칙 뒤에 적용돼요") }
+        let last = c.rules.filter { !$0.isRemaining }.count - 1
         let to: Int
         switch where_ {
         case "up": to = max(0, i - 1)
@@ -1127,8 +1229,8 @@ func pfCounters() -> [String: Int] {
     for line in run("/sbin/pfctl", ["-a", Paths.anchor, "-vvs", "rules"]).out.split(separator: "\n") {
         if line.hasPrefix("@"), line.contains(" pass ") {
             current = nil                                  // 기록용 통과 줄은 세지 않는다
-        } else if let r = line.range(of: " to ") {
-            current = line[r.upperBound...].split(separator: " ").first.map(String.init)
+        } else if line.hasPrefix("@"), let target = displayedPFTarget(String(line)) {
+            current = target
         } else if let c = current, let r = line.range(of: "Packets: ") {
             let n = Int(line[r.upperBound...].split(separator: " ").first ?? "") ?? 0
             for a in pfTargetAddresses(c) { out[a] = n }
@@ -1202,18 +1304,27 @@ func selftestLocked(port: UInt16, verbose: Bool) -> Int32 {
         default: print("  · \(r.title): \(r.reason) — 점검 안 함\n"); continue
         }
         // 도메인은 주소 두 개까지만, 가려진 주소·제외한 주소는 빼고
-        let addrs = r.targets.flatMap { t in
-            t.addresses.filter { !$0.ip.contains(":") && !$0.ip.contains("/") && $0.owner == nil && $0.note == nil }.prefix(t.kind == .domain ? 2 : 1)
+        let addrs = r.targets.flatMap { t -> [AddressStatus] in
+            if t.kind == .remaining {
+                // Avoid the root-only health probe exemption at 1.1.1.1:443.
+                guard let ip = ["1.0.0.1", "9.9.9.9", "8.8.8.8"].first(where: { candidate in
+                    t.addresses.contains { targetCovered(candidate, by: $0.ip) }
+                }), let prefix = t.addresses.first(where: { targetCovered(ip, by: $0.ip) }) else { return [] }
+                var address = prefix; address.ip = ip
+                return [address]
+            }
+            return Array(
+            t.addresses.filter { !$0.ip.contains(":") && !$0.ip.contains("/") && $0.owner == nil && $0.note == nil }.prefix(t.kind == .domain ? 2 : 1))
         }
         guard !addrs.isEmpty else { print("  ? \(r.title): 점검할 IPv4 주소 없음\n"); continue }
         print("  \(r.title) — \(allow.map { "\(r.chosenExit.map(Exits.label) ?? "")(\($0))로만" } ?? "모두 차단")")
         for a in addrs {
             for ifc in [nil] + ifaces.map(Optional.some) {
-                let c0 = pfCounters()[a.ip] ?? 0
+                let c0 = pfCounters().filter { $0.key == a.ip || targetCovered(a.ip, by: $0.key) }.values.reduce(0, +)
                 let t0 = Date()
                 let res = probe(a.ip, port, ifname: ifc)
                 let elapsed = Date().timeIntervalSince(t0)
-                let c1 = pfCounters()[a.ip] ?? 0
+                let c1 = pfCounters().filter { $0.key == a.ip || targetCovered(a.ip, by: $0.key) }.values.reduce(0, +)
                 let byRule = c1 > c0
                 // 경로가 없어 아예 못 보낸 경우(오류)는 새지 않은 것이다 (링크 꺼짐, 터널 재연결 중 등).
                 let notSent = res == .error && !byRule
@@ -1329,6 +1440,7 @@ func cmdUninstall() {
 
 // MARK: - 진입
 
+#if !WIFI_EXIT_TESTING
 @main
 enum Engine {
     static func main() {
@@ -1400,3 +1512,5 @@ enum Engine {
         }
     }
 }
+
+#endif

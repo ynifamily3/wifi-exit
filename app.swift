@@ -473,7 +473,7 @@ enum CLI {
       wifi-exit list [--json]            규칙 목록 (위에서부터 적용, 한 주소에는 처음 맞는 규칙 하나)
       wifi-exit exits                    지금 쓸 수 있는 출구
       wifi-exit add <대상> [--via 출구,…] [--else block|system|next] [메모]
-                                         대상 = IPv4 | IPv4/프리픽스 | 도메인. 이미 있으면 켜고 바꾼다
+                                         대상 = IPv4 | IPv4/프리픽스 | 도메인 | remaining(나머지 트래픽). 이미 있으면 켜고 바꾼다
                                          출구 기본값 wifi, 없을 때 기본값 block(차단)
       wifi-exit set <대상|id> [--via 출구,…] [--else …] [--when 조건] [--name 메모]
                                          add 도 --when 을 받는다. 조건이 안 맞으면 그 규칙은 건너뛴다
@@ -839,7 +839,7 @@ enum CLI {
     static func explain(_ raw: String) -> Int32 {
         guard let s = readStatus() else { return fail("엔진 상태가 없어요") }
         let key = Target.parse(raw)?.0 ?? raw.lowercased()
-        let hits = s.rules.filter { r in r.id == key || r.targets.contains { $0.target == key || $0.addresses.contains { $0.ip == key } } }
+        let hits = s.rules.filter { r in r.id == key || r.targets.contains { $0.target == key || $0.addresses.contains { $0.ip == key || targetCovered(key, by: $0.ip) } } }
         if hits.isEmpty { print("\(raw): 어느 규칙에도 없어요 → 평소 경로(\(s.defaultIfText))로 나가요"); return 0 }
         print("\(raw) 를 다루는 규칙 (위에서부터 처음 맞는 규칙 하나가 맡음)\n")
         var decided = false
