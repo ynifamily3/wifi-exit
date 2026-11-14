@@ -106,15 +106,27 @@ final class AppRuleProvider: NETransparentProxyProvider, NEAppProxyUDPFlowHandli
             let host: String
             if case .hostPort(let value, _) = endpoint { host = "\(value)" } else { host = "" }
             if SplitPolicy.ownedByHost(host, status: engine) { report.system += 1; return false }
-            guard config.rules.contains(where: { $0.candidate(signingID: signingID) }) else { return false }
-            let decision = SplitPolicy.decide(config, signingID: signingID, teamID: sourceTeam(flow.metaData.sourceAppAuditToken), exits: report.exits)
+            var decision = SplitDecision.system
+            var ruleMatched = false
+            if config.rules.contains(where: { $0.candidate(signingID: signingID) }) {
+                let team = sourceTeam(flow.metaData.sourceAppAuditToken)
+                decision = SplitPolicy.decide(config, signingID: signingID, teamID: team, exits: report.exits)
+                ruleMatched = team.map { t in config.rules.contains { $0.matches(signingID: signingID, teamID: t) } } ?? false
+            }
+            // An app's own rule (including its "system" fallback) wins; only apps without one follow the others policy.
+            if decision == .system, !ruleMatched {
+                decision = SplitPolicy.decideOthers(config, signingID: signingID, flowInterface: interfaceName(flow),
+                                                    defaultIf: engine?.defaultIf, exits: report.exits)
+            }
             switch decision {
             case .system: report.system += 1; return false
             case .block(let rule):
                 report.blocked += 1; report.note = "\(ruleName(rule)): 출구 없음 또는 앱 서명 확인 실패 → 차단" + (SplitIdentity.lastLookupError.isEmpty ? "" : " (\(SplitIdentity.lastLookupError))")
                 reject(flow, error: relayError(report.note)); return true
             case .route(let rule, let iface):
-                guard sessions.count < 2048, let networkInterface = interfaces[iface] else {
+                // Moving other apps off the VPN is best effort: past the relay limit they keep the system path.
+                if rule == SplitPolicy.othersRule, sessions.count >= 4096 || interfaces[iface] == nil { report.system += 1; return false }
+                guard sessions.count < 8192, let networkInterface = interfaces[iface] else {
                     report.blocked += 1
                     reject(flow, error: relayError("출구 없음 또는 연결 한도 초과")); return true
                 }
@@ -149,7 +161,15 @@ final class AppRuleProvider: NETransparentProxyProvider, NEAppProxyUDPFlowHandli
         }
         return team
     }
-    private func ruleName(_ id: String) -> String { config.rules.first { $0.id == id }?.name ?? "앱" }
+    private func ruleName(_ id: String) -> String {
+        if id == SplitPolicy.othersRule { return "나머지 앱" }
+        return config.rules.first { $0.id == id }?.name ?? "앱"
+    }
+    /// The interface the system would send this flow out of (before we take it).
+    private func interfaceName(_ flow: NEAppProxyFlow) -> String? {
+        guard let interface = flow.networkInterface else { return nil }
+        return String(cString: nw_interface_get_name(interface))
+    }
     private func cancelSessions() {
         let existing = Array(sessions.values); sessions.removeAll()
         for session in existing { session.cancel() }

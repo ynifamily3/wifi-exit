@@ -175,7 +175,7 @@ final class SplitModel: ObservableObject {
     }
     func turnOn() {
         guard !busy else { return }
-        guard config.rules.contains(where: \.enabled) else { note = "먼저 앱 규칙을 추가해 주세요"; return }
+        guard config.rules.contains(where: \.enabled) || config.others?.enabled == true else { note = "먼저 앱 규칙을 추가해 주세요"; return }
         if SplitPolicy.requiresEngineMigration(config: FileManager.default.contents(atPath: Paths.config), status: FileManager.default.contents(atPath: Paths.status)) { note = "메뉴에서 엔진 갱신을 먼저 실행해 주세요. 이전 버전의 라우트를 정리해야 해요"; return }
         busy = true; note = nil
         _ = SplitExtensionRequest(activate: true, update: { [weak self] text in self?.note = text }) { [weak self] ready, message in
@@ -240,6 +240,7 @@ struct AppRulesView: View {
                 } label: { Image(systemName: "ellipsis.circle") }.fixedSize().disabled(model.busy)
             }.padding(16)
             if let note = model.note { Text(note).foregroundStyle(.orange).font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 10) }
+            othersBar
             Divider()
             HSplitView {
                 VStack(alignment: .leading) {
@@ -276,6 +277,23 @@ struct AppRulesView: View {
         .confirmationDialog("앱별 스플리팅의 프록시 구성과 확장을 제거할까요?", isPresented: $confirmRemove) {
             Button("제거", role: .destructive) { Task { await model.turnOff(remove: true) } }
         }
+    }
+    /// "Only chosen apps use the VPN": while a VPN holds the default route, apps without a rule leave through Wi-Fi.
+    private var othersBar: some View {
+        let others = model.config.others ?? OthersPolicy()
+        let save: (OthersPolicy) -> Void = { value in var next = model.config; next.others = value; Task { await model.save(next) } }
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Toggle("VPN이 켜져 있으면 규칙 없는 앱은", isOn: Binding(get: { others.enabled }, set: { var o = others; o.enabled = $0; save(o) }))
+                Picker("", selection: Binding(get: { others.exits.first ?? "wifi" }, set: { var o = others; o.exits = [$0]; save(o) })) {
+                    ForEach(["wifi", "wired", "tether"], id: \.self) { Text(Exits.label($0)).tag($0) }
+                }.labelsHidden().fixedSize().disabled(!others.enabled)
+                Text("으로 보내기")
+                Spacer()
+            }
+            Text("켜면 'VPN' 출구를 지정한 앱만 VPN을 쓰고, 나머지 앱은 VPN 대신 고른 출구로 나가요. DNS 조회와 다른 VPN·Tailscale 경로는 그대로예요. 출구가 없으면 평소 경로(VPN)를 써요.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.padding(.horizontal, 16).padding(.bottom, 10).disabled(model.busy)
     }
     private func binding<T>(_ path: WritableKeyPath<SplitRule, T>) -> Binding<T> {
         Binding(get: { draft![keyPath: path] }, set: { draft?[keyPath: path] = $0 })
@@ -367,7 +385,8 @@ enum AppSplitCLI {
                 case "status":
                     let manager = try await SplitControl.manager()
                     var value: [String: Any] = ["enabled": manager?.isEnabled == true, "connected": manager?.connection.status == .connected,
-                        "extension": SplitControl.installed(), "rules": try JSONSerialization.jsonObject(with: JSONEncoder().encode(config.rules))]
+                        "extension": SplitControl.installed(), "rules": try JSONSerialization.jsonObject(with: JSONEncoder().encode(config.rules)),
+                        "others": try JSONSerialization.jsonObject(with: JSONEncoder().encode(config.others ?? OthersPolicy()))]
                     if let manager, manager.connection.status == .connected,
                        let report = try await SplitControl.message(Data("status".utf8), manager: manager) {
                         value["report"] = try JSONSerialization.jsonObject(with: report)
@@ -396,8 +415,19 @@ enum AppSplitCLI {
                     if command == "rm" { config.rules.remove(at: index) } else { config.rules[index].enabled = command == "on" }
                     config = try await SplitControl.store(config)
                     UserDefaults.standard.set(try JSONEncoder().encode(config), forKey: "appSplitConfig")
+                case "others":
+                    // apps others on [--via wifi] | off — VPN이 기본 경로일 때 규칙 없는 앱의 출구
+                    guard args.count >= 2, ["on", "off"].contains(args[1]) else { throw relayHostError("apps others on [--via wifi|wired|tether,…] | off") }
+                    var others = config.others ?? OthersPolicy()
+                    others.enabled = args[1] == "on"
+                    if args.count == 4, args[2] == "--via", let exits = Exits.parseList(args[3]), !exits.isEmpty { others.exits = exits }
+                    else if args.count != 2 { throw relayHostError("옵션: --via <출구 목록>") }
+                    config.others = others
+                    config = try await SplitControl.store(config)
+                    UserDefaults.standard.set(try JSONEncoder().encode(config), forKey: "appSplitConfig")
+                    print(others.enabled ? "VPN이 켜져 있으면 규칙 없는 앱 → \(others.exits.map(Exits.label).joined(separator: " → "))" : "규칙 없는 앱은 평소 경로")
                 case "enable":
-                    guard config.rules.contains(where: \.enabled) else { throw relayHostError("먼저 앱을 등록해 주세요") }
+                    guard config.rules.contains(where: \.enabled) || config.others?.enabled == true else { throw relayHostError("먼저 앱을 등록해 주세요") }
                     if SplitPolicy.requiresEngineMigration(config: FileManager.default.contents(atPath: Paths.config), status: FileManager.default.contents(atPath: Paths.status)) { throw relayHostError("엔진 갱신을 먼저 실행해 주세요") }
                     let ready: Bool = await withCheckedContinuation { continuation in
                         _ = SplitExtensionRequest(activate: true, update: { print($0); fflush(stdout) }) { ready, note in
@@ -417,7 +447,7 @@ enum AppSplitCLI {
                             }
                         }
                     }
-                default: throw relayHostError("apps [edit|status|add <앱.app>|rm|on|off <앱ID>|enable|disable|remove]")
+                default: throw relayHostError("apps [edit|status|add <앱.app>|rm|on|off <앱ID>|others on|off|enable|disable|remove]")
                 }
                 if uninstallAll {
                     UserDefaults.standard.removeObject(forKey: "appSplitConfig")

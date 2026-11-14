@@ -87,10 +87,18 @@ func timeText(_ epoch: Int) -> String {
 
 enum Engine {
     /// 심볼릭 링크(~/.local/bin/wifi-exit)로 불려도 번들 안의 엔진을 찾는다.
+    /// argv[0] 은 PATH 로 불리면 "wifi-exit" 같은 상대 이름이라 쓰지 않고, 커널이 아는 실행 파일 경로를 쓴다.
     static var bundled: URL {
-        URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        executableURL().resolvingSymlinksInPath()
             .deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Helpers/wifi-exitd")
+    }
+    private static func executableURL() -> URL {
+        var size: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &size)
+        var buffer = [CChar](repeating: 0, count: Int(size) + 1)
+        if _NSGetExecutablePath(&buffer, &size) == 0 { return URL(fileURLWithPath: String(cString: buffer)) }
+        return URL(fileURLWithPath: CommandLine.arguments[0])
     }
 
     static func installedAtAll() -> Bool { FileManager.default.fileExists(atPath: Paths.engine) }
@@ -492,7 +500,8 @@ enum CLI {
       wifi-exit profile [add <이름> [wifi|wired|tether] | rm <이름>]
                                          지금 붙은 망(게이트웨이 IP + MAC)을 이름 붙여 저장한다
       wifi-exit edit [대상|id]            규칙 편집 창을 연다
-      wifi-exit apps [edit|status|add|rm|on|off|enable|disable|remove]  앱별 스플리팅
+      wifi-exit apps [edit|status|add|rm|on|off|others|enable|disable|remove]  앱별 스플리팅
+                                         apps others on [--via wifi]: VPN이 켜져 있으면 규칙 없는 앱은 Wi-Fi로
       wifi-exit view                     라우팅 보기 창: 연결이 앱 → 규칙 → 출구로 흐르는 모습
       wifi-exit watch [--json]           규칙 대상으로 가는 새 연결을 실시간으로 한 줄씩 (Ctrl-C 로 끝).
                                          보는 동안만 엔진이 pf 기록을 켠다

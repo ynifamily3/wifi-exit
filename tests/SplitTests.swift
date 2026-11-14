@@ -56,6 +56,22 @@ struct SplitTests {
         rule.helpers = false; config.rules = [rule]
         check(SplitPolicy.decide(config, signingID: "org.example.engine.helper", teamID: rule.teamID, exits: [wifi]) == .system, "helpers off")
         rule.helpers = true; config.rules = [rule]
+
+        // Others policy: only apps with a VPN rule stay in the tunnel; the rest leave through Wi-Fi.
+        let vpn = SplitExit(selector: "vpn:connect", iface: "utun9", ip: "10.0.0.9")
+        var others = SplitConfig(rules: [], others: OthersPolicy(enabled: true, exits: ["wifi"]))
+        check(SplitPolicy.decideOthers(others, signingID: "com.example.any", flowInterface: "utun9", defaultIf: "utun9", exits: [wifi, vpn]) == .route(rule: SplitPolicy.othersRule, iface: "en1"), "others leave VPN default route")
+        check(SplitPolicy.decideOthers(others, signingID: "com.example.any", flowInterface: "en1", defaultIf: "en1", exits: [wifi, vpn]) == .system, "others untouched without VPN")
+        check(SplitPolicy.decideOthers(others, signingID: "io.tailscale.ipn", flowInterface: "utun4", defaultIf: "utun9", exits: [wifi, vpn]) == .system, "specific routes into other tunnels untouched")
+        check(SplitPolicy.decideOthers(others, signingID: "com.apple.mDNSResponder", flowInterface: "utun9", defaultIf: "utun9", exits: [wifi, vpn]) == .system, "DNS keeps following the VPN resolver")
+        check(SplitPolicy.decideOthers(others, signingID: "com.miel.WifiExit.engine", flowInterface: "utun9", defaultIf: "utun9", exits: [wifi, vpn]) == .system, "own probes untouched")
+        check(SplitPolicy.decideOthers(others, signingID: "com.example.any", flowInterface: "utun9", defaultIf: "utun9", exits: [vpn]) == .system, "no Wi-Fi keeps the system path, never blocks")
+        check(SplitPolicy.decideOthers(others, signingID: "com.example.any", flowInterface: "utun9", defaultIf: nil, exits: [wifi, vpn]) == .system, "unknown default route is left alone")
+        others.others?.enabled = false
+        check(SplitPolicy.decideOthers(others, signingID: "com.example.any", flowInterface: "utun9", defaultIf: "utun9", exits: [wifi, vpn]) == .system, "others off")
+        check(SplitConfig(others: OthersPolicy(enabled: true, exits: ["bogus"])).problem != nil, "others exits validated")
+        let legacy = try JSONDecoder().decode(SplitConfig.self, from: Data(#"{"version":1,"rules":[]}"#.utf8))
+        check(legacy.others == nil && legacy.problem == nil, "configs without others still decode")
         check(SplitPolicy.decide(config, signingID: rule.signingID, teamID: "XXXXXXXXXX", exits: [wifi]) == .system, "other publisher")
         check(SplitPolicy.decide(config, signingID: rule.signingID, teamID: nil, exits: [wifi]) == .block(rule: rule.id), "unknown identity fails closed")
         check(SplitPolicy.decide(config, signingID: rule.signingID, teamID: rule.teamID, exits: [wired]) == .block(rule: rule.id), "missing exit fails closed")

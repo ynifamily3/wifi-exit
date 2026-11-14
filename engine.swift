@@ -514,6 +514,14 @@ func nextHealth(_ old: Health?, ok: Bool, ms: Int?, detail: String, forced: Bool
 /// 출구마다(그리고 점검 대상이 있는 규칙마다) 한 번씩 점검한다. 쓸 수 있는지가 바뀌었으면 true.
 /// 잠금 없이 돈다 (점검이 느려도 규칙 적용을 붙잡지 않는다).
 @discardableResult
+/// 시스템 기본 리졸버의 IPv4 DNS 서버 (State:/Network/Global/DNS).
+func globalDNSServers() -> [String] {
+    guard let store = SCDynamicStoreCreate(nil, "wifi-exitd-dns" as CFString, nil, nil),
+          let dns = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
+          let servers = dns["ServerAddresses"] as? [String] else { return [] }
+    return servers.filter { Target.ipv4Number($0) != nil }
+}
+
 func healthRound() -> Bool {
     let net = readNet(), config = loadConfig(), ov = healthOverrides()
     let old = readJSON(Paths.health, HealthDB.self) ?? HealthDB()
@@ -522,10 +530,15 @@ func healthRound() -> Bool {
     var exitRes: [String: (Bool, Int?, String, Bool)] = [:]
     var ruleRes: [String: (Bool, Int?, String, Bool)] = [:]
 
+    let globalDNS = globalDNSServers()
     for e in net.exits where e.up {
         // 출구의 DNS 서버(53)와, VPN 이 아니면 1.1.1.1:443. 우리 규칙이 이 출구에서 막는 주소는 빼고.
+        // VPN 은 클라이언트가 정한 DNS(예: 1.0.0.1)를 게이트웨이가 막고 게이트웨이가 준 DNS(예: 8.8.8.8)만
+        // 통과시키기도 하므로, 터널로 시스템 DNS 서버들도 시도한다.
         var targets: [(String, UInt16)] = []
-        if let d = e.dns.first { targets.append((d, 53)) }
+        if e.name == "vpn" {
+            for d in uniq(e.dns + globalDNS).prefix(4) { targets.append((d, 53)) }
+        } else if let d = e.dns.first { targets.append((d, 53)) }
         if e.name != "vpn" { targets.append(("1.1.1.1", 443)) }
         targets = targets.filter { t in
             guard let allow = pf[t.0] else { return true }
