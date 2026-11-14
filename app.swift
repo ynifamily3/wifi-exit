@@ -248,6 +248,8 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.reloadStatus() }
         }
         Task { await refresh() }
+        // 켜 둔 앱별 스플리팅이 재부팅·업데이트 뒤 끊긴 채로 남지 않게 다시 붙인다.
+        Task { if let manager = try? await SplitControl.manager() { try? await SplitControl.ensureRunning(manager) } }
     }
 
     enum Overall { case needsEngine, stale, paused, leak, noWifi, idle, ok }

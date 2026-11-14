@@ -38,6 +38,7 @@ final class AppRuleProvider: NETransparentProxyProvider, NEAppProxyUDPFlowHandli
     private var engineSignature = Data()
     private var report = SplitReport()
     private var stopping = false
+    private var teamCache: [Data: String] = [:]
 
     override func startProxy(options: [String: Any]?, completionHandler: @escaping (Error?) -> Void) {
         guard let protocolConfig = protocolConfiguration as? NETunnelProviderProtocol,
@@ -106,7 +107,7 @@ final class AppRuleProvider: NETransparentProxyProvider, NEAppProxyUDPFlowHandli
             if case .hostPort(let value, _) = endpoint { host = "\(value)" } else { host = "" }
             if SplitPolicy.ownedByHost(host, status: engine) { report.system += 1; return false }
             guard config.rules.contains(where: { $0.candidate(signingID: signingID) }) else { return false }
-            let decision = SplitPolicy.decide(config, signingID: signingID, teamID: SplitIdentity.sourceTeam(flow.metaData.sourceAppAuditToken), exits: report.exits)
+            let decision = SplitPolicy.decide(config, signingID: signingID, teamID: sourceTeam(flow.metaData.sourceAppAuditToken), exits: report.exits)
             switch decision {
             case .system: report.system += 1; return false
             case .block(let rule):
@@ -136,6 +137,17 @@ final class AppRuleProvider: NETransparentProxyProvider, NEAppProxyUDPFlowHandli
         flow.open(withLocalFlowEndpoint: nil) { _ in
             flow.closeReadWithError(error); flow.closeWriteWithError(error)
         }
+    }
+    /// Verified team per process. The audit token carries pid + pidversion, so a key
+    /// never outlives the process it describes; only successful lookups are cached.
+    private func sourceTeam(_ token: Data?) -> String? {
+        if let token, let cached = teamCache[token] { return cached }
+        let team = SplitIdentity.sourceTeam(token)
+        if let token, let team {
+            if teamCache.count >= 512 { teamCache.removeAll() }
+            teamCache[token] = team
+        }
+        return team
     }
     private func ruleName(_ id: String) -> String { config.rules.first { $0.id == id }?.name ?? "앱" }
     private func cancelSessions() {

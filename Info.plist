@@ -15,7 +15,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.7</string>
+	<string>0.7.1</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -28,12 +28,12 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>13</string>
+	<string>14</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.2</string>
-	<key>NSSystemExtensionUsageDescription</key>
-	<string>선택한 앱의 TCP·UDP 연결을 지정한 네트워크로 중계합니다.</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>선택한 앱의 TCP·UDP 연결을 지정한 네트워크로 중계합니다.</string>
 </dict>
 </plist>

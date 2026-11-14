@@ -46,7 +46,16 @@ struct SplitTests {
         var config = SplitConfig(rules: [rule])
         check(SplitPolicy.decide(config, signingID: rule.signingID, teamID: rule.teamID, exits: [wifi]) == .route(rule: rule.id, iface: "en1"), "exact app")
         check(SplitPolicy.decide(config, signingID: rule.signingID + ".helper", teamID: rule.teamID, exits: [wifi]) == .route(rule: rule.id, iface: "en1"), "same-team helper")
-        check(SplitPolicy.decide(config, signingID: rule.signingID + "evil", teamID: rule.teamID, exits: [wifi]) == .system, "helper boundary")
+        check(SplitPolicy.decide(config, signingID: rule.signingID + "evil", teamID: "XXXXXXXXXX", exits: [wifi]) == .system, "helper boundary")
+        // Dia-style: the network helper is signed as a sibling identifier of the same vendor.
+        check(SplitPolicy.decide(config, signingID: "org.example.engine.helper", teamID: rule.teamID, exits: [wifi]) == .route(rule: rule.id, iface: "en1"), "same-team sibling helper")
+        check(SplitPolicy.decide(config, signingID: "org.example.engine.helper", teamID: "XXXXXXXXXX", exits: [wifi]) == .system, "sibling from other publisher")
+        check(SplitPolicy.decide(config, signingID: "org.example.engine.helper", teamID: nil, exits: [wifi]) == .system, "unverified sibling is not blocked")
+        check(SplitPolicy.decide(config, signingID: rule.signingID + ".helper", teamID: nil, exits: [wifi]) == .block(rule: rule.id), "unverified nested helper fails closed")
+        check(SplitPolicy.decide(config, signingID: "com.other.app", teamID: rule.teamID, exits: [wifi]) == .system, "same team, other vendor")
+        rule.helpers = false; config.rules = [rule]
+        check(SplitPolicy.decide(config, signingID: "org.example.engine.helper", teamID: rule.teamID, exits: [wifi]) == .system, "helpers off")
+        rule.helpers = true; config.rules = [rule]
         check(SplitPolicy.decide(config, signingID: rule.signingID, teamID: "XXXXXXXXXX", exits: [wifi]) == .system, "other publisher")
         check(SplitPolicy.decide(config, signingID: rule.signingID, teamID: nil, exits: [wifi]) == .block(rule: rule.id), "unknown identity fails closed")
         check(SplitPolicy.decide(config, signingID: rule.signingID, teamID: rule.teamID, exits: [wired]) == .block(rule: rule.id), "missing exit fails closed")

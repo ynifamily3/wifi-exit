@@ -65,26 +65,44 @@ enum SplitControl {
         protocolConfig.providerConfiguration = ["config": try JSONEncoder().encode(config)]
         manager.protocolConfiguration = protocolConfig
         manager.localizedDescription = "Wi-Fi Exit 앱별 스플리팅"
-        if enable { manager.isEnabled = true }
+        // A turned-on proxy that is merely disconnected (e.g. after a reboot, app update or a
+        // save while it was down) must come back too, otherwise every rule silently stops applying.
+        let on = enable || manager.isEnabled
+        if on { keepConnected(manager) }
         try await save(manager)
-        if enable { try manager.connection.startVPNTunnel() }
+        if on { try manager.connection.startVPNTunnel() }
         return config
+    }
+    /// Turned-on proxy reconnects by itself: on demand covers reboots and system-initiated stops.
+    static func keepConnected(_ manager: NETransparentProxyManager) {
+        manager.isEnabled = true
+        manager.onDemandRules = [NEOnDemandRuleConnect()]
+        manager.isOnDemandEnabled = true
+    }
+    /// Repairs a turned-on proxy left disconnected or saved before on-demand existed.
+    static func ensureRunning(_ manager: NETransparentProxyManager) async throws {
+        guard manager.isEnabled else { return }
+        if !manager.isOnDemandEnabled { keepConnected(manager); try await save(manager) }
+        if manager.connection.status == .disconnected || manager.connection.status == .invalid {
+            try manager.connection.startVPNTunnel()
+        }
     }
     static func disable(remove: Bool = false) async throws {
         guard let manager = try await manager() else { return }
         let latest = try await currentConfig(SplitConfig(), manager: manager)
         if remove, manager.connection.status == .connected { _ = try await message(Data("clear".utf8), manager: manager) }
+        // Turn on-demand off first, or the system reconnects the proxy right after the stop.
+        if let protocolConfig = manager.protocolConfiguration as? NETunnelProviderProtocol, !remove {
+            protocolConfig.providerConfiguration = ["config": try JSONEncoder().encode(latest)]
+            manager.protocolConfiguration = protocolConfig
+        }
+        manager.isOnDemandEnabled = false
+        manager.isEnabled = false; try await save(manager)
         manager.connection.stopVPNTunnel()
         if remove {
             try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
                 manager.removeFromPreferences { error in if let error { c.resume(throwing: error) } else { c.resume() } }
             }
-        } else {
-            if let protocolConfig = manager.protocolConfiguration as? NETunnelProviderProtocol {
-                protocolConfig.providerConfiguration = ["config": try JSONEncoder().encode(latest)]
-                manager.protocolConfiguration = protocolConfig
-            }
-            manager.isEnabled = false; try await save(manager)
         }
     }
     static func installed() -> String {
@@ -139,6 +157,7 @@ final class SplitModel: ObservableObject {
         extensionState = await background { SplitControl.installed() }
         do {
             let manager = try await SplitControl.manager()
+            if let manager { try await SplitControl.ensureRunning(manager) }
             enabled = manager?.isEnabled == true; connected = manager?.connection.status == .connected
             config = try await SplitControl.currentConfig(config, manager: manager)
             if connected, let manager, let data = try await SplitControl.message(Data("status".utf8), manager: manager),

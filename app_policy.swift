@@ -10,12 +10,26 @@ struct SplitRule: Codable, Equatable, Identifiable {
     var exits = ["wifi"]
     var fallback = "block"
 
-    func candidate(signingID source: String) -> Bool {
+    /// The app itself or a helper nested under its signing identifier (e.g. `<id>.helper`).
+    /// Fails closed when the source's team cannot be verified.
+    func strictCandidate(signingID source: String) -> Bool {
         enabled && (source == signingID || (helpers && !teamID.isEmpty && source.hasPrefix(signingID + ".")))
+    }
+    /// Also helpers signed under a sibling identifier from the same vendor, such as
+    /// Dia (`company.thebrowser.dia`) whose network traffic comes from
+    /// `company.thebrowser.browser.helper`. These still need a verified team match.
+    func candidate(signingID source: String) -> Bool {
+        strictCandidate(signingID: source) || (enabled && helpers && !teamID.isEmpty && !source.isEmpty
+            && SplitRule.vendor(source) == SplitRule.vendor(signingID))
     }
     func matches(signingID source: String, teamID team: String) -> Bool {
         guard enabled, !source.isEmpty, teamID == team else { return false }
-        return source == signingID || (helpers && !teamID.isEmpty && source.hasPrefix(signingID + "."))
+        return candidate(signingID: source)
+    }
+    /// Reverse-DNS vendor part of a signing identifier: `company.thebrowser.dia` → `company.thebrowser`.
+    static func vendor(_ id: String) -> String {
+        let parts = id.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count >= 3 ? parts.prefix(2).joined(separator: ".") : id
     }
 }
 
@@ -84,8 +98,9 @@ enum SplitPolicy {
     }
 
     static func decide(_ config: SplitConfig, signingID: String, teamID: String?, exits: [SplitExit]) -> SplitDecision {
-        if teamID == nil, let candidate = config.rules.first(where: { $0.candidate(signingID: signingID) }) {
-            return .block(rule: candidate.id)
+        if teamID == nil {
+            if let candidate = config.rules.first(where: { $0.strictCandidate(signingID: signingID) }) { return .block(rule: candidate.id) }
+            return .system
         }
         guard let rule = config.rules.first(where: { $0.matches(signingID: signingID, teamID: teamID ?? "") }) else { return .system }
         for name in rule.exits {
