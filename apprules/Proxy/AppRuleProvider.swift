@@ -124,6 +124,9 @@ final class AppRuleProvider: NETransparentProxyProvider, NEAppProxyUDPFlowHandli
                 report.blocked += 1; report.note = "\(ruleName(rule)): 출구 없음 또는 앱 서명 확인 실패 → 차단" + (SplitIdentity.lastLookupError.isEmpty ? "" : " (\(SplitIdentity.lastLookupError))")
                 reject(flow, error: relayError(report.note)); return true
             case .route(let rule, let iface):
+                // Already headed out of the chosen exit: leave the flow to the system. Relaying would gain nothing
+                // and breaks protocols that negotiate their own UDP ports (e.g. Screen Sharing high performance).
+                if iface == interfaceName(flow) { report.system += 1; report.note = "\(ruleName(rule)) → \(iface) (그대로)"; return false }
                 // Moving other apps off the VPN is best effort: past the relay limit they keep the system path.
                 if rule == SplitPolicy.othersRule, sessions.count >= 4096 || interfaces[iface] == nil { report.system += 1; return false }
                 guard sessions.count < 8192, let networkInterface = interfaces[iface] else {

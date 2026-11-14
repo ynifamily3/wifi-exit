@@ -997,7 +997,80 @@ enum CLI {
 
 // MARK: - 화면
 
+/// 메뉴바 앱이지만 창(규칙·앱별 스플리팅·라우팅 보기)이 열려 있는 동안은 보통 앱처럼 Dock 아이콘과
+/// 메뉴 막대를 갖는다 — 그래야 ⌘W(닫기)·⌘Q(종료)·⌘M·전체화면 같은 표준 단축키가 창에서 동작한다.
+/// 창을 모두 닫으면 다시 메뉴바 전용(Dock 없음)으로 돌아간다.
+final class WindowPolicy: NSObject, NSApplicationDelegate {
+    private var observers: [NSObjectProtocol] = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let center = NotificationCenter.default
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let window = note.object as? NSWindow, Self.isAppWindow(window) else { return }
+                self?.prepare(window)
+                self?.update()
+            })
+        }
+        observers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] _ in
+            // 닫히는 창은 아직 보이는 상태라 한 바퀴 뒤에 센다.
+            DispatchQueue.main.async { self?.update() }
+        })
+    }
+
+    /// 제목 막대가 있는 보통 창만 센다. 메뉴바 팝업(NSPanel)·상태 막대 창은 빼고.
+    static func isAppWindow(_ window: NSWindow) -> Bool {
+        !(window is NSPanel) && window.styleMask.contains(.titled) && window.level == .normal
+    }
+
+    private func prepare(_ window: NSWindow) {
+        // 크기를 바꿀 수 있는 창은 전체화면(초록 버튼·⌃⌘F)을 허용한다. 라우팅 보기(모니터링)가 대상.
+        if window.styleMask.contains(.resizable) {
+            window.collectionBehavior.remove(.fullScreenAuxiliary)
+            window.collectionBehavior.insert(.fullScreenPrimary)
+        }
+    }
+
+    private func update() {
+        let open = NSApp.windows.contains { Self.isAppWindow($0) && $0.isVisible }
+        let policy: NSApplication.ActivationPolicy = open ? .regular : .accessory
+        guard NSApp.activationPolicy() != policy else { return }
+        NSApp.setActivationPolicy(policy)
+        if open { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    /// Dock 아이콘을 눌렀는데 열린 창이 없으면 규칙 창을 연다.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !NSApp.windows.contains(where: { Self.isAppWindow($0) && $0.isVisible }), let url = URL(string: "wifi-exit://rules") {
+            NSWorkspace.shared.open(url)
+        }
+        return true
+    }
+
+    /// 마지막 창을 닫아도 메뉴바 앱은 계속 돈다.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+}
+
+/// 창이 열려 있을 때 보이는 메뉴 막대: ⌘, 는 규칙 창(설정), 윈도우 메뉴에서 다른 창으로.
+struct AppCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("규칙 편집…") { open("rules") }.keyboardShortcut(",", modifiers: .command)
+        }
+        CommandGroup(replacing: .newItem) {}
+        CommandGroup(before: .windowList) {
+            Button("규칙 편집") { open("rules") }
+            Button("앱별 스플리팅") { open("app-rules") }
+            Button("라우팅 보기") { open("routes") }.keyboardShortcut("r", modifiers: .command)
+            Divider()
+        }
+    }
+    private func open(_ id: String) { NSApp.activate(ignoringOtherApps: true); openWindow(id: id) }
+}
+
 struct WifiExitApp: App {
+    @NSApplicationDelegateAdaptor(WindowPolicy.self) private var windowPolicy
     @StateObject private var model = AppModel()
 
     var body: some Scene {
@@ -1017,6 +1090,7 @@ struct WifiExitApp: App {
         }
         .defaultSize(width: 900, height: 620)
         .handlesExternalEvents(matching: ["rules"])
+        .commands { AppCommands() }
 
         Window("앱별 스플리팅", id: "app-rules") {
             AppRulesView().onOpenURL { _ in NSApp.activate(ignoringOtherApps: true) }
