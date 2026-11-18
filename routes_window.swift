@@ -115,6 +115,9 @@ final class EventStream: ObservableObject {
     }
 
     private func publishStats() {
+        // 3분 넘게 연결이 없는 앱 칸은 흐려지며 뺀다 (예전에는 7개가 넘어야만 빠져서 지난 앱이 계속 남았다)
+        let liveApps = Set(dests.values.filter { !$0.live.isEmpty }.map(\.app))
+        if scene.pruneApps(olderThan: 180, keep: liveApps) { animating = true }
         if !meters.isEmpty { statsDirty = true }      // 트래픽 칸은 조용해져도 1초마다 한 칸씩 흘러가야 한다
         guard statsDirty else { return }
         statsDirty = false
@@ -431,6 +434,19 @@ final class RouteScene {
     var onMoving: ((Bool) -> Void)?
     static let appearDuration = 0.35
     static let leaveDuration = 0.3
+
+    /// 오래 조용한 앱 칸을 뺀다. 뺀 것이 있으면 true
+    func pruneApps(olderThan age: TimeInterval, keep: Set<String>, now: Date = Date()) -> Bool {
+        let stale = apps.filter { !keep.contains($0) && now.timeIntervalSince(appSeen[$0] ?? .distantPast) > age }
+        guard !stale.isEmpty else { return false }
+        for a in stale {
+            apps.removeAll { $0 == a }
+            if !reduceMotion, let at = shown["a:" + a] { leaving[a] = (now, at) }
+            shown["a:" + a] = nil
+        }
+        moving = true
+        return true
+    }
 
     func addPulse(_ key: String, dir: Int, now: Date = Date()) {
         guard !reduceMotion, !paused else { return }
@@ -979,8 +995,34 @@ struct RoutesWindow: View {
             }
             .scrollDisabled(innerW * scale <= geo.size.width + 0.5 && innerH * scale <= geo.size.height + 0.5)
             .overlay(alignment: .top) { zoomChip.padding(.top, 10) }
+            .overlay { emptyState }
         }
         .background(stage)
+    }
+
+    /// 규칙이 없고 "규칙 대상만"이면 그릴 것이 없다. 빈 화면 대신 까닭과 할 일을 보여 준다
+    private var showsEmptyCard: Bool { allRules.isEmpty && !stream.allTraffic && stream.scene.outsideGroups.isEmpty }
+
+    @ViewBuilder private var emptyState: some View {
+        if showsEmptyCard {
+            VStack(spacing: 10) {
+                Image(systemName: "point.3.connected.trianglepath.dotted").font(.system(size: 26, weight: .light)).foregroundStyle(muted)
+                Text("켜진 규칙이 없어요").font(.system(size: 15, weight: .semibold)).foregroundStyle(fg)
+                Text("규칙을 추가하거나 모든 연결을 켜면 여기에 그려져요")
+                    .font(.system(size: 12)).foregroundStyle(muted).multilineTextAlignment(.center)
+                HStack(spacing: 8) {
+                    Button("규칙 추가…") { m.windowSelection = "new"; NSApp.activate(); openWindow(id: "rules") }
+                        .buttonStyle(.borderedProminent).controlSize(.regular)
+                    Button("모든 연결 보기") { stream.setAllTraffic(true) }
+                        .controlSize(.regular)
+                }
+                .padding(.top, 4)
+            }
+            .padding(.horizontal, 28).padding(.vertical, 22)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(dark ? Color(red: 0.13, green: 0.14, blue: 0.162) : Color(red: 0.985, green: 0.985, blue: 0.988))
+                .shadow(color: .black.opacity(dark ? 0.45 : 0.08), radius: 12, y: 3))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder((dark ? Color.white : .black).opacity(0.06)))
+        }
     }
 
     /// 하나만 보는 중일 때 흐름도 위에 뜨는 띠: 무엇을 보는지 + 전체로 돌아가기 (Esc·빈 곳 클릭도 같다)
@@ -1702,7 +1744,7 @@ struct RoutesWindow: View {
             if let icon = scene.icons[a] { c.draw(Image(nsImage: icon), in: CGRect(x: rect.minX + 9, y: lv.at.y - 9, width: 18, height: 18)) }
             c.draw(Text(a).font(NodeToken.appTitle).foregroundColor(fg), at: CGPoint(x: rect.minX + 32, y: lv.at.y), anchor: .leading)
         }
-        if visibleApps.isEmpty {
+        if visibleApps.isEmpty && !showsEmptyCard {
             label("연결을 기다리는 중", CGPoint(x: size.width * 0.11, y: size.height / 2), muted, .caption)
         }
 
@@ -1968,7 +2010,7 @@ struct RoutesWindow: View {
         .overlay {
             if ns.isEmpty {
                 ContentUnavailableView(search.isEmpty ? "아직 연결 없음" : "결과 없음", systemImage: "point.3.connected.trianglepath.dotted",
-                                       description: Text(search.isEmpty ? "규칙 대상으로 가는 연결이 생기면 보여요" : ""))
+                                       description: Text(search.isEmpty ? (stream.allTraffic ? "새 연결이 생기면 보여요" : "규칙 대상 연결이 생기면 보여요") : ""))
             }
         }
     }
