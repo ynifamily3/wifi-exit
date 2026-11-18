@@ -1,0 +1,245 @@
+{
+  "version": 2,
+  "generatedAt": 0,
+  "paused": false,
+  "wifi": {
+    "if": "en0",
+    "ip": "192.168.0.23",
+    "gateway": "192.168.0.1",
+    "dns": [
+      "192.168.0.1"
+    ],
+    "signature": "",
+    "up": true
+  },
+  "defaultIf": "utun4",
+  "pfEnabled": true,
+  "lastResolve": 0,
+  "lastApply": 0,
+  "vpnOver": "wifi",
+  "exits": [
+    {
+      "name": "wifi",
+      "iface": "en0",
+      "ip": "192.168.0.23",
+      "gateway": "192.168.0.1",
+      "dns": [
+        "192.168.0.1"
+      ],
+      "portal": "",
+      "up": true,
+      "healthy": true
+    },
+    {
+      "name": "wired",
+      "iface": "en7",
+      "ip": "10.10.20.31",
+      "gateway": "10.10.20.1",
+      "dns": [
+        "10.10.0.53"
+      ],
+      "portal": "",
+      "up": true,
+      "healthy": true,
+      "signature": "IPv4.Router=10.10.20.1;IPv4.RouterHardwareAddress=02:00:00:aa:bb:cc"
+    },
+    {
+      "name": "vpn",
+      "iface": "utun4",
+      "ip": "10.124.14.52",
+      "gateway": "",
+      "dns": [
+        "10.124.0.10"
+      ],
+      "portal": "pass",
+      "up": true,
+      "healthy": true
+    },
+    {
+      "name": "vpn",
+      "iface": "utun6",
+      "ip": "10.200.3.18",
+      "gateway": "",
+      "dns": [
+        "10.200.0.10"
+      ],
+      "portal": "cloud",
+      "up": true,
+      "healthy": false,
+      "healthDetail": "10.200.0.10:53 응답 없음"
+    }
+  ],
+  "rules": [
+    {
+      "id": "r1",
+      "name": "사내 Git",
+      "enabled": true,
+      "exits": [
+        "wifi"
+      ],
+      "elseAction": "block",
+      "chosenExit": "wifi",
+      "chosenIface": "en0",
+      "decision": "route",
+      "reason": "Wi-Fi(en0) 있음",
+      "targets": [
+        {
+          "target": "git.example.com",
+          "kind": "domain",
+          "addresses": [
+            {
+              "ip": "192.0.2.10",
+              "interface": "en0",
+              "pinned": true,
+              "blocked": true
+            },
+            {
+              "ip": "192.0.2.11",
+              "interface": "en0",
+              "pinned": true,
+              "blocked": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "r2",
+      "name": "결제 API",
+      "enabled": true,
+      "exits": [
+        "vpn:pass",
+        "wifi"
+      ],
+      "elseAction": "block",
+      "chosenExit": "vpn:pass",
+      "chosenIface": "utun4",
+      "decision": "route",
+      "reason": "VPN:pass(utun4) 있음",
+      "targets": [
+        {
+          "target": "203.0.113.0/24",
+          "kind": "cidr",
+          "addresses": [
+            {
+              "ip": "203.0.113.0/24",
+              "interface": "utun4",
+              "pinned": true,
+              "blocked": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "r3",
+      "name": "회의실 NAS",
+      "enabled": true,
+      "exits": [
+        "wired"
+      ],
+      "elseAction": "next",
+      "decision": "route",
+      "when": "profile=사무실",
+      "conditionDetail": "profile=사무실 ✓",
+      "reason": "조건 맞음 · 유선(en7) 있음",
+      "targets": [
+        {
+          "target": "10.20.0.5",
+          "kind": "ip",
+          "addresses": [
+            {
+              "ip": "10.20.0.5",
+              "interface": "en7",
+              "pinned": true,
+              "blocked": true
+            }
+          ]
+        }
+      ],
+      "chosenExit": "wired",
+      "chosenIface": "en7"
+    },
+    {
+      "id": "r4",
+      "name": "",
+      "enabled": true,
+      "exits": [
+        "tether"
+      ],
+      "elseAction": "block",
+      "decision": "block",
+      "reason": "테더링 없음 → 차단",
+      "targets": [
+        {
+          "target": "198.51.100.7",
+          "kind": "ip",
+          "addresses": [
+            {
+              "ip": "198.51.100.7",
+              "interface": "utun4",
+              "pinned": false,
+              "blocked": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "r6",
+      "name": "야간 백업",
+      "enabled": true,
+      "exits": [
+        "wired",
+        "wifi"
+      ],
+      "elseAction": "block",
+      "decision": "skip",
+      "when": "time=01:00-05:00",
+      "conditionDetail": "time=01:00-05:00 ✗ (지금 11:50)",
+      "reason": "조건이 안 맞아 건너뜀",
+      "targets": [
+        {
+          "target": "backup.example.org",
+          "kind": "domain",
+          "addresses": [
+            {
+              "ip": "198.51.100.90",
+              "interface": "utun4",
+              "pinned": false,
+              "blocked": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "r5",
+      "name": "스트리밍",
+      "enabled": false,
+      "exits": [
+        "wifi"
+      ],
+      "elseAction": "system",
+      "chosenExit": "wifi",
+      "chosenIface": "en0",
+      "decision": "off",
+      "reason": "꺼짐",
+      "targets": [
+        {
+          "target": "media.example.net",
+          "kind": "domain",
+          "addresses": [
+            {
+              "ip": "198.51.100.40",
+              "interface": "en0",
+              "pinned": true,
+              "blocked": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "errors": []
+}

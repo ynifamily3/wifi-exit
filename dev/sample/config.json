@@ -1,0 +1,97 @@
+{
+  "version": 2,
+  "paused": false,
+  "rules": [
+    {
+      "id": "r1",
+      "name": "사내 Git",
+      "enabled": true,
+      "targets": [
+        "git.example.com"
+      ],
+      "when": "always",
+      "exits": [
+        "wifi"
+      ],
+      "else": "block"
+    },
+    {
+      "id": "r2",
+      "name": "결제 API",
+      "enabled": true,
+      "targets": [
+        "203.0.113.0/24"
+      ],
+      "when": "always",
+      "exits": [
+        "vpn:pass",
+        "wifi"
+      ],
+      "else": "block"
+    },
+    {
+      "id": "r3",
+      "name": "회의실 NAS",
+      "enabled": true,
+      "targets": [
+        "10.20.0.5"
+      ],
+      "when": {
+        "profile": "사무실"
+      },
+      "exits": [
+        "wired"
+      ],
+      "else": "next"
+    },
+    {
+      "id": "r4",
+      "name": "",
+      "enabled": true,
+      "targets": [
+        "198.51.100.7"
+      ],
+      "when": "always",
+      "exits": [
+        "tether"
+      ],
+      "else": "block"
+    },
+    {
+      "id": "r6",
+      "name": "야간 백업",
+      "enabled": true,
+      "targets": [
+        "backup.example.org"
+      ],
+      "when": {
+        "time": "01:00-05:00"
+      },
+      "exits": [
+        "wired",
+        "wifi"
+      ],
+      "else": "block"
+    },
+    {
+      "id": "r5",
+      "name": "스트리밍",
+      "enabled": false,
+      "targets": [
+        "media.example.net"
+      ],
+      "when": "always",
+      "exits": [
+        "wifi"
+      ],
+      "else": "system"
+    }
+  ],
+  "profiles": {
+    "사무실": {
+      "link": "wired",
+      "gateway": "10.10.20.1",
+      "gatewayMac": "02:00:00:aa:bb:cc"
+    }
+  }
+}

@@ -19,6 +19,7 @@ targets:
     platform: macOS
     sources:
       - ../app.swift
+      - ../popup.swift
       - ../rules_window.swift
       - ../routes_window.swift
       - ../outside.swift
@@ -29,6 +30,7 @@ targets:
       - ../app_policy.swift
       - ../app_identity.swift
       - ../app_rules.swift
+      - ../dev_sample.swift
       - path: ../icon/AppIcon.icns
         buildPhase: resources
     info:

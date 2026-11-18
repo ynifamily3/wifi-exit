@@ -21,8 +21,8 @@ macOS 15.2 이상, Apple Silicon.
 
 ## 규칙 편집 창
 
-메뉴바의 목록 아이콘이나 규칙 줄의 슬라이더 아이콘, 또는 `wifi-exit edit [대상]`(`wifi-exit://rules`)로 연다.
-- **왼쪽:** 규칙 목록. 끌어서 순서를 바꾼다. 아래쪽은 네트워크 프로필 목록.
+메뉴바 팝업 아래 줄의 목록 단추(⌘,)나 규칙 줄을 눌러 나오는 **편집…**, 또는 `wifi-exit edit [대상]`(`wifi-exit://rules`)로 연다.
+- **왼쪽:** 규칙 목록. 검색할 수 있고, 끌어서 순서를 바꾸고, 줄 끝의 상자로 켜고 끈다. 아래쪽은 네트워크 프로필 목록.
 - **오른쪽:** 규칙 폼.
   - 대상: 여러 개 넣을 수 있고, 도메인은 지금 풀린 IP를 함께 보여 준다.
   - 출구 순위: 끌어서 바꾸고, 출구마다 지금 있는지 표시한다.
@@ -33,8 +33,8 @@ macOS 15.2 이상, Apple Silicon.
 
 ## 앱별 스플리팅 (0.7)
 
-메뉴바 → **앱별 스플리팅…**에서 **앱 추가…**로 앱을 고르고, 출구 순위와 출구가 없을 때 동작을 저장한다.
-상단의 **켜기**를 누르면 처음 한 번 macOS가 시스템 확장과 프록시 구성의 허용을 요청한다.
+메뉴바 팝업의 **앱별** 타일(또는 `wifi-exit apps`)로 창을 열고, 도구 막대의 **+**로 앱을 고르고, 출구 순위와 출구가 없을 때 동작을 저장한다.
+도구 막대의 전원 단추를 켜면 처음 한 번 macOS가 시스템 확장과 프록시 구성의 허용을 요청한다.
 시스템 설정 → 일반 → 로그인 항목 및 확장 → 네트워크 확장에서 Wi-Fi Exit를 허용한다.
 본 앱을 `/Applications`에 설치한 뒤 켜야 한다. 기존 엔진이 있다면 먼저 **엔진 갱신**을 실행한다.
 
@@ -95,17 +95,19 @@ wifi-exit apps remove                  # 프록시 구성·확장 제거
 | 파일 | 역할 |
 |---|---|
 | `engine.swift` | root 엔진 `wifi-exitd`. `/Library/PrivilegedHelperTools/com.miel.WifiExit.engine`에 root 소유로 깔린다. LaunchDaemon `ing.miel.wifi-exit`가 상주시킨다 |
-| `app.swift` | 메뉴바 앱이자 `wifi-exit` CLI (같은 실행 파일) |
+| `app.swift` | 메뉴바 앱이자 `wifi-exit` CLI (같은 실행 파일). 창(규칙·앱별 스플리팅·라우팅 보기)은 SwiftUI 장면 |
+| `popup.swift` | 메뉴바 아이콘과 팝업(NSPopover). Little Snitch Control Center 를 참고한 짜임: 맨 위 타일(전체 켜기·지금 망·앱별), 출구마다 그리로 나가는 규칙을 묶은 카드, 막는 중·쉬는 규칙 카드, 아래 줄의 창 단추 |
 | `shared.swift` | 경로, 설정(v2), 상태 모델, 대상 검사 |
 | `conditions.swift` | 조건 모델·파서·판단, 출구 결정, 조건 빌더 모델, 가려진 규칙 검사 (엔진과 앱이 함께 씀) |
 | `rules_window.swift` | 규칙 편집 창 |
-| `ui_kit.swift` | 세 화면이 같이 쓰는 모양: 출구 기호(SF Symbols)·색(시스템 색: Wi-Fi 파랑, 유선 청록, 테더링 분홍, VPN 보라, 차단 빨강), 출구·상태 배지, 규칙 요약 문구, 경고 목록. 초록·주황·빨강은 상태(정상·경고·오류)에만 쓴다 |
+| `ui_kit.swift` | 세 화면이 같이 쓰는 모양: 상태 색(흑연 팔레트: 정상·켜짐은 무채색, 주의는 호박색, 막힘·오류는 산호색. 그라데이션으로 칠하지 않는다), 출구 기호(무채색 동그라미), 규칙 요약 문구, 경고 목록 |
 | `exit_reasons.swift` | 출구가 "지금 없음"일 때 까닭 (네트워크 설정의 서비스 + 인터페이스 상태). 앱·CLI 쪽만 쓰므로 엔진 갱신이 필요 없다 |
-| `routes_window.swift` | 라우팅 보기 창. 연결이 열리면 앱 → 규칙 → 출구로 길이 그려지고(출발 포트·목적 포트 표시), 패킷이 오갈 때마다 그 길로 캡슐이 움직인다(나감 = 출구 색 캡슐, 들어옴 = 작은 점; 많으면 표본으로 줄이되 한 번이라도 오가면 최소 1개). 닫히면 길이 흐려진다. 최근 10분 타임라인·되감기. 앱·규칙·출구 칸을 두 번 누르거나 "보기" 메뉴로 그것만 집중해서 보기 |
+| `routes_window.swift` | 라우팅 보기 창 (Little Snitch Network Monitor 를 참고한 짜임). 왼쪽: 연결 목록(앱 ▸ 목적지 · 출구 → 앱 · 규칙 → 앱으로 묶기, 검색, 줄마다 최근 12초 보냄·받음 막대)과 최근 10분 트래픽 막대(끌어서 되감기). 가운데: 앱 → 규칙 → 출구 흐름도. 선 색은 나가는 출구, 굵기는 최근 6초 오간 양, 진하기는 열린 연결. 데이터가 오가면 경로를 따라 빛줄기가 흐르고 도착점에서 원이 퍼진다. 선·칸에 마우스를 올리면 그 경로만 강조하고, 목록에서 고르면 그것만 본다(Esc·빈 곳 클릭으로 전체). 창이 좁으면 비율대로 줄인다. 오른쪽: 고른 것의 규칙·출구·이유·오간 양을 보여 주는 인스펙터 |
 | `outside.swift` | 라우팅 보기의 "전체" 범위: 연결 표를 1초마다 훑어 규칙 밖 연결의 열림·오감(받은/보낸 바이트 증가, 패킷 수는 1200바이트당 1개로 어림)·닫힘을 찾고, 역방향 조회로 이름을 붙임. 규칙 밖 연결은 목적지 등록 도메인(없으면 IP)마다 칸을 따로 두고(최대 8개), 칸을 눌러 "이 목적지로 규칙 만들기" |
 | `events.swift` | 연결 사건 흐름: `watch` 중에만 pf 기록을 켜고, pflog 를 해석해 열림·막힘을, `pfctl -vss` 계수기를 0.5초마다 읽어 오감(패킷·바이트 차이)·닫힘을 `/var/run/wifi-exit/events.sock` 으로 보냄. 한 연결의 사건은 열림 → 오감 → 닫힘 순서를 지킨다 (엔진에 들어감) |
 | `app_rules.swift`, `app_policy.swift`, `apprules/` | 앱별 스플리팅 편집·제어·서명 식별·출구 결정과 TCP/UDP 투명 프록시 시스템 확장. 본 앱에 함께 포함한다 |
 | `icon/` | 앱 아이콘을 코드로 그리는 `make_icon.swift`와 `make_icns.sh` |
+| `dev.sh`, `dev_sample.swift`, `dev/sample/` | 개발 실행 (아래 "개발 실행"). `dev_sample.swift` 는 DEBUG 빌드에만 들어가는 표본 상태·가짜 연결 |
 
 데이터는 `/Library/Application Support/WifiExit/`에 둔다.
 - `config.json`: 규칙. root만 쓴다. 바뀌면 데몬이 곧바로 적용한다.
@@ -164,6 +166,23 @@ wifi-exit install        # engine.swift 가 바뀌었을 때 root 쪽 갱신 (su
 서명은 키체인의 첫 "Developer ID Application" 인증서로 한다. 다른 인증서는 `WIFI_EXIT_IDENTITY`, 공증 프로필(`xcrun notarytool store-credentials`로 저장한 이름)은 `WIFI_EXIT_NOTARY_PROFILE`로 정한다.
 
 앱 메뉴의 "엔진 갱신"도 같은 일을 한다. 깔린 엔진의 코드(CDHash)가 앱에 든 엔진과 다르면 앱이 갱신하라고 알려 준다. 서명 시각만 다른 재빌드는 갱신이 필요 없다. 처음 설치할 때 v1 설정(`hosts`, `resolved`, `routes`)은 자동으로 `config.json`과 `state/`로 옮긴다.
+
+## 개발 실행
+
+Xcode·Developer ID 없이 swiftc 만으로 앱을 빌드해 `/Applications/Wi-Fi Exit Dev.app` 으로 띄운다 (Command Line Tools 만 있으면 된다).
+
+```bash
+./dev.sh               # 깔린 엔진의 실제 상태로
+./dev.sh --sample      # 엔진 없이 dev/sample 의 표본 규칙·출구와 가짜 연결로 (팝업·규칙 창·라우팅 보기)
+./dev.sh --dark        # 어두운 모양으로 (--light: 밝은 모양). --sample 과 함께 써도 된다
+./dev.sh --remove      # Dev 앱 지우기
+```
+
+- Dev 앱은 번들 ID 가 `com.miel.WifiExit.dev` 라 설치본과 설정·로그인 항목이 섞이지 않고, 로그인 항목으로 등록하지 않는다. 설치본이 실행 중이면 시작하지 않고, 이전 Dev 앱은 끄고 다시 띄운다.
+- `/Applications` 에 두는 까닭: macOS 27 의 메뉴바 정리 앱(Hidden Bar 1.11 등)은 `/Applications` 에서 실행한 앱만 번들 ID 로 알아본다. 처음 한 번은 아이콘을 ⌘-드래그로 화살표 오른쪽에 옮긴다.
+- 표본 상태에서 규칙 켜기·끄기와 일시정지는 메모리의 표본만 바꾸고, 그 밖의 편집은 하지 않는다.
+- 스크립트는 엔진을 설치하지 않는다. Dev 앱에 든 엔진(ad-hoc 서명)으로 설치·갱신하려면 터미널에서 `"/Applications/Wi-Fi Exit Dev.app/Contents/MacOS/WifiExit" install` (관리자 암호), 지우려면 같은 경로로 `uninstall`.
+- ad-hoc 서명이라 Network Extension 권한이 없어, 앱별 스플리팅 창은 열리지만 켤 수는 없다.
 
 ## 주의
 
