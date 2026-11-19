@@ -170,6 +170,14 @@ struct ConnEvent: Codable {
     var flowKey: String { "\(proto) \(src):\(sport)>\(dst):\(dport)" }
 }
 
+/// watch 로 흘려보내는 이름 하나: 엔진이 DNS 응답이나 TLS SNI 에서 알아낸 IP 의 이름 (names.swift).
+/// 연결 사건과 다른 줄이라 옛 앱은 읽지 못하고 건너뛴다.
+struct LearnedName: Codable, Equatable {
+    var ip: String
+    var host: String
+    var via: String             // dns | sni
+}
+
 struct EngineConfig: Codable, Equatable {
     var version: Int = 2
     var paused: Bool = false

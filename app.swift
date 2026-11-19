@@ -155,7 +155,10 @@ enum Engine {
     /// 인자는 NFC 로 바꿔 넘긴다 (터미널에서 온 한글이 자모로 풀려 있으면 메모가 깨져 보인다).
     @discardableResult
     static func run(_ args: [String]) -> ShellResult {
-        sh("/usr/bin/sudo", ["-n", Paths.engine] + args.map(\.precomposedStringWithCanonicalMapping))
+        #if DEBUG
+        if DevSample.on { return DevSample.run(args) }
+        #endif
+        return sh("/usr/bin/sudo", ["-n", Paths.engine] + args.map(\.precomposedStringWithCanonicalMapping))
     }
 }
 
@@ -199,14 +202,16 @@ extension RuleState {
 }
 
 extension Color {
-    /// 출구 색 = 시스템 색. 초록·주황·빨강은 상태(정상·경고·오류)에 쓰므로 출구에는 쓰지 않는다 (차단만 빨강).
-    static func exit(_ name: String) -> Color {
+    /// 출구 색 (라우팅 보기의 선·출구 칸). 채도와 밝기를 눌러 차분하고 무게 있는 톤을 밝은/어두운 모양 쌍으로:
+    /// Wi-Fi 슬레이트 블루, 유선 세이지, 테더링 황토, VPN 더스티 모브, 막음 벽돌색.
+    static func exit(_ name: String, dark: Bool) -> Color {
+        func c(_ r: Double, _ g: Double, _ b: Double) -> Color { Color(red: r, green: g, blue: b) }
         switch Exits.kind(name) {
-        case "wifi": return .blue
-        case "wired": return .teal
-        case "tether": return .pink
-        case "block": return .red
-        default: return .purple   // vpn
+        case "wifi": return dark ? c(0.50, 0.58, 0.71) : c(0.36, 0.45, 0.60)
+        case "wired": return dark ? c(0.50, 0.63, 0.55) : c(0.37, 0.50, 0.43)
+        case "tether": return dark ? c(0.70, 0.59, 0.45) : c(0.58, 0.47, 0.33)
+        case "block": return dark ? c(0.76, 0.49, 0.46) : c(0.62, 0.36, 0.33)
+        default: return dark ? c(0.61, 0.55, 0.70) : c(0.47, 0.41, 0.57)   // vpn
         }
     }
 }
@@ -232,6 +237,9 @@ let STALE_AFTER = 120   // 엔진이 이보다 오래 상태를 안 쓰면 데�
 
 @MainActor
 final class AppModel: ObservableObject {
+    /// 앱 하나에 모델 하나: SwiftUI 창들과 메뉴바 팝업(AppKit)이 같이 쓴다.
+    static let shared = AppModel()
+
     @Published var status: EngineStatus?
     @Published var engineReady = false
     @Published var engineOutdated = false
@@ -241,6 +249,8 @@ final class AppModel: ObservableObject {
     @Published var config: EngineConfig?
     @Published var windowSelection: String?     // 편집 창에서 고른 것: "rule:<id>" | "profile:<이름>" | "new"
     @Published var drafts: [String: RuleDraft] = [:]   // 편집 창의 저장하지 않은 편집 (키는 windowSelection 과 같다)
+    @Published var pendingSplitApp: URL?        // 라우팅 보기의 "앱별 스플리팅에 추가…": 앱별 스플리팅 창이 이 앱으로 새 규칙을 연다
+    @Published var splitEnabled = false                 // 앱별 스플리팅 프록시가 켜져 있는지 (팝업 타일)
 
     private var timer: Timer?
 
@@ -284,6 +294,14 @@ final class AppModel: ObservableObject {
     }
 
     func reloadStatus() {
+        #if DEBUG
+        if DevSample.on {
+            let (s, c) = DevSample.snapshot()
+            status = s
+            if c != config { config = c }
+            return
+        }
+        #endif
         status = readStatus()
         // CLI(wifi-exit edit)가 남긴 선택
         // 앱 자신의 도메인(com.miel.WifiExit)은 suiteName 으로 열면 안 되고 standard 로 읽어야 한다
@@ -359,6 +377,10 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() async {
+        #if DEBUG
+        if DevSample.on { engineReady = true; engineOutdated = false; reloadStatus(); return }
+        #endif
+        splitEnabled = ((try? await SplitControl.manager()) ?? nil)?.isEnabled == true
         let (ready, installed, canRun) = await background { () -> (Bool, Bool, Bool) in
             let installed = Engine.installedAtAll()
             return (Engine.ready(), installed, installed && Engine.sudoOK())
@@ -397,7 +419,7 @@ final class AppModel: ObservableObject {
         guard let s = status else { return }
         let link = s.exits.first { $0.up && $0.name == "wifi" }?.name ?? s.exits.first { $0.up && ($0.name == "wired" || $0.name == "tether") }?.name
         guard let link else { message = "지금 연결된 Wi-Fi나 유선이 없어요."; return }
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         let alert = NSAlert()
         alert.messageText = "지금 \(Exits.label(link)) 망을 프로필로 저장"
         alert.informativeText = "게이트웨이 주소와 MAC으로 같은 망인지 가려요. 조건에 profile=<이름> 으로 씁니다."
@@ -435,7 +457,7 @@ final class AppModel: ObservableObject {
     func openLog() { sh("/usr/bin/open", ["-a", "Console", Paths.log]) }
 
     func uninstall() async {
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         let alert = NSAlert()
         alert.messageText = "Wi-Fi Exit 설정을 모두 지울까요?"
         alert.informativeText = "앱별 스플리팅의 프록시 구성·확장·앱 규칙과 호스트의 고정 라우트·pf 규칙·DNS 설정·엔진을 정리합니다. 연결은 평소 시스템 경로로 돌아갑니다. 확장 제거는 재부팅 때 완료될 수 있습니다."
@@ -471,6 +493,14 @@ enum Entry {
         if CLI.shouldHandle(CommandLine.arguments) {
             exit(CLI.run(Array(CommandLine.arguments.dropFirst())))
         }
+        #if DEBUG
+        // ./dev.sh --dark | --light: 시스템 설정을 바꾸지 않고 두 모양을 확인한다.
+        switch ProcessInfo.processInfo.environment["WIFIEXIT_APPEARANCE"] {
+        case "dark": NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
+        case "light": NSApplication.shared.appearance = NSAppearance(named: .aqua)
+        default: break
+        }
+        #endif
         WifiExitApp.main()
     }
 }
@@ -1002,8 +1032,10 @@ enum CLI {
 /// 창을 모두 닫으면 다시 메뉴바 전용(Dock 없음)으로 돌아간다.
 final class WindowPolicy: NSObject, NSApplicationDelegate {
     private var observers: [NSObjectProtocol] = []
+    private var statusBar: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        statusBar = StatusBarController(model: .shared)
         let center = NotificationCenter.default
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
@@ -1018,7 +1050,7 @@ final class WindowPolicy: NSObject, NSApplicationDelegate {
         })
     }
 
-    /// 제목 막대가 있는 보통 창만 센다. 메뉴바 팝업(NSPanel)·상태 막대 창은 빼고.
+    /// 제목 막대가 있는 보통 창만 센다. 메뉴바 팝업·상태 막대 창은 빼고.
     static func isAppWindow(_ window: NSWindow) -> Bool {
         !(window is NSPanel) && window.styleMask.contains(.titled) && window.level == .normal
     }
@@ -1036,14 +1068,12 @@ final class WindowPolicy: NSObject, NSApplicationDelegate {
         let policy: NSApplication.ActivationPolicy = open ? .regular : .accessory
         guard NSApp.activationPolicy() != policy else { return }
         NSApp.setActivationPolicy(policy)
-        if open { NSApp.activate(ignoringOtherApps: true) }
+        if open { NSApp.activate() }
     }
 
     /// Dock 아이콘을 눌렀는데 열린 창이 없으면 규칙 창을 연다.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !NSApp.windows.contains(where: { Self.isAppWindow($0) && $0.isVisible }), let url = URL(string: "wifi-exit://rules") {
-            NSWorkspace.shared.open(url)
-        }
+        if !NSApp.windows.contains(where: { Self.isAppWindow($0) && $0.isVisible }) { AppWindows.open("rules") }
         return true
     }
 
@@ -1066,425 +1096,63 @@ struct AppCommands: Commands {
             Divider()
         }
     }
-    private func open(_ id: String) { NSApp.activate(ignoringOtherApps: true); openWindow(id: id) }
+    private func open(_ id: String) { NSApp.activate(); openWindow(id: id) }
 }
 
+/// 팝업(NSPopover)은 SwiftUI 장면 밖이라 openWindow 를 쓸 수 없다. 창 장면이 받는 wifi-exit:// 주소를
+/// 이 앱 자신에게 보낸다 (CLI 의 `wifi-exit edit`·`view` 와 같은 길). 앱을 지정해 보내므로 같은 주소를 받는
+/// 다른 Wi-Fi Exit(설치본과 dev 빌드)가 대신 받지 않는다.
+@MainActor
+enum AppWindows {
+    static func open(_ id: String) {
+        guard let url = URL(string: "wifi-exit://\(id)") else { return }
+        NSApp.activate()
+        NSWorkspace.shared.open([url], withApplicationAt: Bundle.main.bundleURL, configuration: NSWorkspace.OpenConfiguration())
+    }
+}
+
+/// 메뉴바 아이콘과 팝업은 AppKit(StatusBarController, popup.swift)이 맡고, 여기에는 창만 둔다.
+/// 창은 실행할 때 저절로 열리지 않고(.suppressed) 팝업·CLI·Dock 아이콘으로만 연다.
 struct WifiExitApp: App {
     @NSApplicationDelegateAdaptor(WindowPolicy.self) private var windowPolicy
-    @StateObject private var model = AppModel()
+    @ObservedObject private var model = AppModel.shared
 
     var body: some Scene {
-        MenuBarExtra {
-            ContentView().environmentObject(model)
-        } label: {
-            Image(systemName: model.menuSymbol)
-        }
-        .menuBarExtraStyle(.window)
-
         Window("Wi-Fi Exit 규칙", id: "rules") {
             RulesWindow().environmentObject(model)
                 .onOpenURL { _ in
                     model.reloadStatus()          // CLI 가 남긴 선택을 바로 반영
-                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.activate()
                 }
         }
         .defaultSize(width: 900, height: 620)
+        .defaultLaunchBehavior(.suppressed)
         .handlesExternalEvents(matching: ["rules"])
         .commands { AppCommands() }
 
         Window("앱별 스플리팅", id: "app-rules") {
-            AppRulesView().onOpenURL { _ in NSApp.activate(ignoringOtherApps: true) }
+            AppRulesView().onOpenURL { _ in NSApp.activate() }
         }
         .defaultSize(width: 850, height: 640)
+        .defaultLaunchBehavior(.suppressed)
         .handlesExternalEvents(matching: ["app-rules"])
 
         Window("라우팅 보기", id: "routes") {
             RoutesWindow().environmentObject(model)
-                .onOpenURL { _ in NSApp.activate(ignoringOtherApps: true) }
+                .onOpenURL { _ in NSApp.activate() }
         }
-        .defaultSize(width: 1080, height: 700)
+        .defaultSize(width: 1240, height: 760)
+        .defaultLaunchBehavior(.suppressed)
         .handlesExternalEvents(matching: ["routes"])
 
         // 개발용: 메뉴바 팝업 내용을 보통 창으로 (wifi-exit://popup-preview) — 화면 확인용
         Window("팝업 미리보기", id: "popup-preview") {
             ContentView().environmentObject(model)
                 .background(.regularMaterial)
-                .onOpenURL { _ in NSApp.activate(ignoringOtherApps: true) }
+                .onOpenURL { _ in NSApp.activate() }
         }
         .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
         .handlesExternalEvents(matching: ["popup-preview"])
-    }
-}
-
-struct ContentView: View {
-    @EnvironmentObject var m: AppModel
-    @Environment(\.openWindow) private var openWindow
-    @State private var newTarget = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            header
-            if let msg = m.message {
-                Text(msg).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true).padding(.horizontal, 4)
-            }
-            let ws = m.warnings
-            if !ws.isEmpty {
-                VStack(spacing: 6) { ForEach(ws) { w in warningBand(w) } }
-            }
-            if let s = m.status {
-                tiles(s)
-                ruleList(s)
-                addRow
-            }
-            menuRows
-        }
-        .padding(12)
-        .frame(width: 340)
-        .task { await m.refresh() }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
-            Task { await m.refresh() }
-        }
-    }
-
-    // MARK: 머리: 상태 기호 + 요약 + 전체 켜기
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            StatusBadge(level: m.statusLevel, size: 34)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.system(size: 13.5, weight: .semibold))
-                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer()
-            if m.busy { ProgressView().controlSize(.small) }
-            Toggle("", isOn: Binding(get: { !(m.status?.paused ?? false) }, set: { on in Task { await m.setPaused(!on) } }))
-                .toggleStyle(.switch).labelsHidden().controlSize(.small)
-                .disabled(!m.engineReady || m.busy)
-                .help("호스트 규칙 켜기 (끄면 등록한 호스트도 평소 경로로)")
-        }
-        .padding(.horizontal, 2)
-    }
-
-    private var title: String {
-        let n = m.warnings.count
-        if n > 0 { return "확인할 것 \(n)개" }
-        guard let s = m.status else { return "Wi-Fi Exit" }
-        return s.activeCount == 0 ? "켜진 규칙 없음" : "규칙 \(s.activeCount)개 적용 중"
-    }
-    private var subtitle: String {
-        guard let s = m.status else { return "엔진 상태를 읽는 중" }
-        return "기본 경로 \(s.defaultIfText) · \(timeText(s.lastApply)) 적용"
-    }
-
-    private func warningBand(_ w: AppWarning) -> some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(w.title).font(.system(size: 12.5, weight: .semibold))
-                Text(w.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2).fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 4)
-            if let a = w.action, let l = w.actionLabel {
-                Button(l) { run(a) }.controlSize(.small).disabled(m.busy)
-            }
-        }
-        .padding(.horizontal, 10).padding(.vertical, 7)
-        .background(RoundedRectangle(cornerRadius: 9).fill((w.level == .error ? Color.red : Color.orange).opacity(0.14)))
-    }
-
-    private func run(_ a: AppWarning.Action) {
-        switch a {
-        case .installEngine: Task { await m.installEngine() }
-        case .apply: Task { await m.apply() }
-        case .resume: Task { await m.setPaused(false) }
-        case .openRules: openRules(nil)
-        }
-    }
-
-    // MARK: 출구 타일
-
-    private struct Tile: Identifiable { let id: String; let kind: String; let label: String; let detail: String; let up: Bool; let warn: Bool }
-
-    private func tileList(_ s: EngineStatus) -> [Tile] {
-        var out = s.exits.map { e in
-            Tile(id: e.iface, kind: e.name, label: e.label, detail: !e.up ? "연결 안 됨" : e.healthy == false ? "응답 없음" : e.iface,
-                 up: e.up, warn: e.up && e.healthy == false)
-        }
-        // 설정에는 있는데 지금 없는 Wi-Fi·유선: 흐리게, 까닭과 함께
-        let ports = ExitWhy.ports()
-        for kind in ["wifi", "wired"] where !s.exits.contains(where: { $0.name == kind }) && !ExitWhy.ports(for: kind, in: ports).isEmpty {
-            out.append(Tile(id: "absent-\(kind)", kind: kind, label: Exits.label(kind),
-                            detail: ExitWhy.reason(kind, exits: s.exits, ports: ports) ?? "지금 없음", up: false, warn: false))
-        }
-        return out
-    }
-
-    private func tiles(_ s: EngineStatus) -> some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
-            ForEach(tileList(s)) { t in
-                VStack(alignment: .leading, spacing: 3) {
-                    ExitBadge(name: t.kind, off: !t.up, size: 20)
-                    Text(t.label).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
-                    Text(t.detail).font(.system(size: 10.5, design: t.up && !t.warn ? .monospaced : .default))
-                        .foregroundStyle(t.warn ? Color.orange : Color.secondary).lineLimit(1).truncationMode(.tail)
-                        .help(t.detail)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.055)))
-                .opacity(t.up ? 1 : 0.6)
-            }
-        }
-    }
-
-    // MARK: 규칙
-
-    private func ruleList(_ s: EngineStatus) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("규칙").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-                Text("위에서부터").font(.caption2).foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 4)
-            if s.rules.isEmpty {
-                Text("등록된 규칙이 없어요").font(.callout).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 40)
-            } else {
-                ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(s.rules) { r in PopupRuleRow(rule: r, state: s.state(of: r), onOpen: { openRules(r.id) }) }
-                    }
-                }
-                // MenuBarExtra 창 안의 ScrollView 는 이상 높이가 없어 줄어든다. 높이를 직접 준다 (8줄 넘으면 스크롤).
-                .frame(height: CGFloat(min(s.rules.count, 8)) * 44)
-            }
-        }
-    }
-
-    private var addRow: some View {
-        HStack(spacing: 7) {
-            Image(systemName: "plus").foregroundStyle(.secondary)
-            TextField("", text: $newTarget, prompt: Text("대상 추가 (IP, 대역, 도메인) — Return"))
-                .textFieldStyle(.plain).onSubmit(add)
-                .disabled(!m.engineReady || m.busy)
-        }
-        .padding(.horizontal, 9).padding(.vertical, 7)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.055)))
-    }
-
-    private func add() {
-        let t = newTarget
-        guard !t.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        newTarget = ""
-        Task { await m.add(t, note: "") }
-    }
-
-    // MARK: 메뉴 줄
-
-    private var menuRows: some View {
-        VStack(spacing: 0) {
-            Divider().padding(.bottom, 4)
-            MenuRow(title: "규칙 편집…", shortcut: "⌘,") { openRules(nil) }
-                .keyboardShortcut(",", modifiers: .command)
-            MenuRow(title: "앱별 스플리팅…", shortcut: "") {
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "app-rules")
-            }
-            MenuRow(title: "라우팅 보기…", shortcut: "⌘R") {
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "routes")
-            }
-            .keyboardShortcut("r", modifiers: .command)
-            Divider().padding(.vertical, 4)
-            Menu {
-                Section {
-                    Button("지금 다시 적용") { Task { await m.apply() } }
-                    Button("도메인 다시 풀기") { Task { await m.resolve() } }
-                    Button("지금 망을 프로필로 저장…") { Task { await m.saveProfile() } }
-                    Button("로그 보기") { m.openLog() }
-                }
-                Section {
-                    Toggle("로그인 시 실행", isOn: Binding(get: { m.loginItem }, set: { m.setLoginItem($0) }))
-                }
-                Section {
-                    Button(m.engineOutdated ? "엔진 갱신" : "엔진 다시 설치") { Task { await m.installEngine() } }
-                }
-                Section {
-                    Button("설정 모두 지우기…", role: .destructive) { Task { await m.uninstall() } }
-                }
-            } label: {
-                HStack {
-                    Text("더 보기")
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 6).padding(.vertical, 3)
-                .contentShape(Rectangle())
-            }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .disabled(m.busy)
-            MenuRow(title: "Wi-Fi Exit 종료", shortcut: "⌘Q") { NSApp.terminate(nil) }
-                .keyboardShortcut("q", modifiers: .command)
-        }
-    }
-
-    private func openRules(_ id: String?) {
-        m.windowSelection = id.map { "rule:" + $0 } ?? m.windowSelection ?? m.config?.rules.first.map { "rule:" + $0.id }
-        NSApp.activate(ignoringOtherApps: true)
-        openWindow(id: "rules")
-    }
-}
-
-/// 팝업의 규칙 한 줄: 지금 나가는 출구 기호 + 이름 + 어디로 보내는 중 + 스위치. 줄을 누르면 편집 창.
-struct PopupRuleRow: View {
-    @EnvironmentObject var m: AppModel
-    let rule: RuleStatus
-    let state: RuleState
-    let onOpen: () -> Void
-    @State private var hover = false
-
-    private var shadowed: String? { m.config?.rules.first { $0.id == rule.id }.flatMap { m.shadowedBy($0) } }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            ExitBadge(name: rule.nowExit ?? rule.exits.first.map(Exits.kind) ?? "block",
-                      off: !rule.enabled || rule.nowExit == nil, size: 22)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(rule.title).font(.system(size: 13, weight: .medium)).lineLimit(1)
-                Group {
-                    if !rule.enabled { Text("꺼짐").foregroundStyle(.secondary) }
-                    else if m.status?.paused == true { Text("일시정지 중 · 평소 경로로 나감").foregroundStyle(.secondary) }
-                    else if state == .leak { Text("차단이 빠짐 · 다시 적용 필요").foregroundStyle(.red) }
-                    else if let by = shadowed { Text("⚠︎ 앞 규칙 \"\(by)\"에 가려져 적용 안 됨").foregroundStyle(.orange) }
-                    else { Text(rule.nowText + (rule.targets.first.map { " · " + $0.target } ?? "")).foregroundStyle(.secondary) }
-                }
-                .font(.caption).lineLimit(1).truncationMode(.tail)
-            }
-            .help(rule.reason)
-            Spacer(minLength: 4)
-            Toggle("", isOn: Binding(get: { rule.enabled }, set: { on in Task { await m.setEnabled(rule.id, on) } }))
-                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                .disabled(!m.engineReady || m.busy)
-        }
-        .padding(.horizontal, 6).frame(height: 44)
-        .background(RoundedRectangle(cornerRadius: 7).fill(hover ? Color.primary.opacity(0.06) : .clear))
-        .contentShape(Rectangle())
-        .onHover { hover = $0 }
-        .onTapGesture(perform: onOpen)
-    }
-}
-
-/// 메뉴 항목처럼 보이는 줄 (마우스를 올리면 강조색)
-struct MenuRow: View {
-    let title: String
-    var shortcut: String? = nil
-    let action: () -> Void
-    @State private var hover = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack {
-                Text(title)
-                Spacer()
-                if let shortcut { Text(shortcut).foregroundStyle(hover ? Color.white.opacity(0.85) : Color.secondary) }
-            }
-            .padding(.horizontal, 6).padding(.vertical, 3)
-            .foregroundStyle(hover ? Color.white : Color.primary)
-            .background(RoundedRectangle(cornerRadius: 5).fill(hover ? Color.accentColor : .clear))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hover = $0 }
-    }
-}
-
-struct ExitChip: View {
-    let name: String
-    let label: String
-    var detail: String? = nil
-    var active = true
-    var rank: Int? = nil
-
-    var body: some View {
-        HStack(spacing: 3) {
-            if let rank { Text("\(rank)").font(.system(size: 9, weight: .bold, design: .monospaced)).opacity(0.7) }
-            Text(label).font(.system(size: 10.5, weight: .medium))
-            if let detail { Text(detail).font(.system(size: 9.5, design: .monospaced)).opacity(0.7) }
-        }
-        .padding(.horizontal, 6).padding(.vertical, 1.5)
-        .foregroundStyle(active ? Color.exit(name) : Color.secondary)
-        .background(Capsule().fill((active ? Color.exit(name) : Color.secondary).opacity(active ? 0.16 : 0.08)))
-        .overlay(Capsule().strokeBorder(active ? .clear : Color.secondary.opacity(0.3), style: StrokeStyle(lineWidth: 0.5, dash: [2])))
-    }
-}
-
-struct RuleRowView: View {
-    @EnvironmentObject var m: AppModel
-    let rule: RuleStatus
-    let index: Int
-    let count: Int
-    let state: RuleState
-    let stateText: String
-    @State private var hover = false
-
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Toggle("", isOn: Binding(get: { rule.enabled }, set: { on in Task { await m.setEnabled(rule.id, on) } }))
-                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                    .disabled(!m.engineReady || m.busy)
-                Image(systemName: state.symbol).foregroundStyle(state.color).frame(width: 16)
-                    .help(rule.reason)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(rule.targets.map(\.target).joined(separator: ", "))
-                            .font(.system(.callout, design: .monospaced).bold()).lineLimit(1)
-                        if !rule.name.isEmpty {
-                            Text(rule.name).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                    }
-                    HStack(spacing: 3) {
-                        if rule.exits.isEmpty { ExitChip(name: "block", label: "그냥 막기", active: false) }
-                        ForEach(Array(rule.exits.enumerated()), id: \.element) { i, e in
-                            ExitChip(name: e, label: Exits.label(e), active: rule.chosenExit == e, rank: rule.exits.count > 1 ? i + 1 : nil)
-                        }
-                        Text("· 없으면 \(Exits.elseLabel(rule.elseAction))").font(.system(size: 10)).foregroundStyle(.tertiary)
-                    }
-                    if let d = rule.conditionDetail {
-                        Text("조건 \(d)").font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(rule.decision == "skip" ? Color.orange : Color.secondary)
-                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                    }
-                    Text(detail).font(.caption2).foregroundStyle(state == .leak ? Color.red : Color.secondary)
-                        .lineLimit(1).truncationMode(.middle)
-                }
-                Spacer(minLength: 0)
-                if hover {
-                    Button {
-                        m.windowSelection = "rule:" + rule.id
-                        NSApp.activate(ignoringOtherApps: true)
-                        openWindow(id: "rules")
-                    } label: { Image(systemName: "slider.horizontal.3") }
-                        .buttonStyle(.borderless).help("편집 창에서 고치기")
-                    Button { Task { await m.remove(rule.id) } } label: { Image(systemName: "trash") }
-                        .buttonStyle(.borderless).help("목록에서 지우기")
-                        .disabled(!m.engineReady || m.busy)
-                }
-            }
-        }
-        .padding(.vertical, 4).padding(.horizontal, 6)
-        .background(RoundedRectangle(cornerRadius: 6).fill(hover ? Color.primary.opacity(0.06) : .clear))
-        .onHover { hover = $0 }
-    }
-
-    private var detail: String {
-        var parts = [stateText]
-        let ips = rule.targets.filter { $0.kind == .domain }.flatMap(\.addresses).map(\.ip)
-        if !ips.isEmpty { parts.append(ips.joined(separator: ", ")) }
-        return parts.joined(separator: " · ")
     }
 }

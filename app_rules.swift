@@ -206,12 +206,16 @@ final class SplitModel: ObservableObject {
     }
 }
 
+/// 앱별 스플리팅 창. 규칙 창과 같은 모양: 왼쪽 목록(앱 · 위에서부터, 규칙 없는 앱), 오른쪽 그룹 폼.
+/// 켜기·끄기와 앱 추가는 도구 막대에, 확장·중계 상태는 창 부제목에 둔다.
+/// 목록은 Little Snitch 의 규칙 목록처럼 실제 앱 아이콘과 켜기 상자를 보여 준다.
 struct AppRulesView: View {
     @StateObject private var model = SplitModel()
     @State private var selection: String?
     @State private var draft: SplitRule?
     @State private var newRule = false
     @State private var confirmRemove = false
+    private static let othersTag = "others"
     private var candidates: [String] {
         var result = ["wifi", "wired", "tether", "vpn:any"]
         for e in model.report.exits where !result.contains(e.selector) { result.append(e.selector) }
@@ -221,54 +225,83 @@ struct AppRulesView: View {
         return result
     }
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(model.connected ? "앱별 스플리팅 켜짐" : "앱별 스플리팅 꺼짐").font(.headline)
-                    Text("확장 \(model.extensionState) · 연결 \(model.report.active) · 누적 중계 \(model.report.accepted) · 차단 \(model.report.blocked)")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if model.busy { ProgressView().controlSize(.small) }
-                Button(model.enabled ? "끄기" : "켜기") {
-                    if model.enabled { Task { await model.turnOff() } } else { model.turnOn() }
-                }.disabled(model.busy)
-                Menu {
-                    Button("상태 새로고침") { Task { await model.refresh() } }
-                    Button("시스템 설정 열기") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences")!) }
-                    Button("프록시 구성 및 확장 제거…", role: .destructive) { confirmRemove = true }
-                } label: { Image(systemName: "ellipsis.circle") }.fixedSize().disabled(model.busy)
-            }.padding(16)
-            if let note = model.note { Text(note).foregroundStyle(.orange).font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 10) }
-            othersBar
-            Divider()
-            HSplitView {
-                VStack(alignment: .leading) {
-                    List(selection: $selection) {
-                        ForEach(model.config.rules) { rule in
-                            HStack {
-                                Image(systemName: "app.fill")
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(rule.name)
-                                    Text(rule.enabled ? (rule.exits.isEmpty ? "차단" : rule.exits.map(Exits.label).joined(separator: " → ")) : "꺼짐")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                            }.tag(rule.id)
+        NavigationSplitView {
+            List(selection: $selection) {
+                Section("앱 · 위에서부터") {
+                    ForEach(model.config.rules) { rule in
+                        AppRuleListItem(rule: rule) { on in
+                            var next = model.config
+                            if let i = next.rules.firstIndex(where: { $0.id == rule.id }) { next.rules[i].enabled = on }
+                            Task { await model.save(next) }
                         }
-                        .onMove { from, to in var next = model.config; next.rules.move(fromOffsets: from, toOffset: to); Task { await model.save(next) } }
+                        .tag(rule.id)
                     }
-                    Button("앱 추가…", action: pickApp).padding(12).disabled(model.busy)
-                }.frame(minWidth: 220, idealWidth: 240, maxWidth: 320)
-                Group {
-                    if draft != nil { editor }
-                    else { ContentUnavailableView("앱을 선택해 주세요", systemImage: "app.badge", description: Text("앱 추가로 출구를 지정할 앱을 고르세요")) }
-                }.frame(minWidth: 440, maxWidth: .infinity, maxHeight: .infinity)
+                    .onMove { from, to in var next = model.config; next.rules.move(fromOffsets: from, toOffset: to); Task { await model.save(next) } }
+                    if model.config.rules.isEmpty {
+                        Text("없음 — + 로 앱을 추가하세요").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Section("규칙 없는 앱") {
+                    let others = model.config.others ?? OthersPolicy()
+                    HStack(spacing: 9) {
+                        Image(systemName: "square.dashed").font(.system(size: 15)).foregroundStyle(.secondary).frame(width: 22, height: 22)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("나머지 앱")
+                            Text(others.enabled ? "VPN이 켜져 있으면 \(Exits.label(others.exits.first ?? "wifi"))로" : "평소 경로")
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                    .tag(Self.othersTag)
+                }
             }
-            Divider()
-            Text("호스트 규칙을 먼저 적용하고 선택한 앱의 새 TCP·UDP 연결만 중계해요. 다른 앱과 시스템 DNS 설정은 그대로예요. 켜거나 앱을 추가한 뒤에는 해당 앱을 다시 열어 기존 연결도 갱신해 주세요.")
-                .font(.caption).foregroundStyle(.secondary).padding(12)
+            .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+            .disabled(model.busy)
+        } detail: {
+            VStack(spacing: 0) {
+                if let note = model.note { noteBand(note) }
+                Group {
+                    if selection == Self.othersTag { othersForm }
+                    else if draft != nil { editor }
+                    else {
+                        ContentUnavailableView("앱을 고르세요", systemImage: "app.badge",
+                                               description: Text("+ 로 앱 추가"))
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .navigationTitle(detailTitle)
+            .navigationSubtitle(statusLine)
+            .toolbar {
+                // Little Snitch 의 필터 빠른 스위치처럼 켜짐을 눌린 상태로 보이는 전원 단추
+                ToolbarItem(placement: .navigation) {
+                    Toggle(isOn: Binding(get: { model.enabled }, set: { on in
+                        if on { model.turnOn() } else { Task { await model.turnOff() } }
+                    })) { Label(model.enabled ? "앱별 스플리팅 끄기" : "앱별 스플리팅 켜기", systemImage: "power") }
+                    .toggleStyle(.button).disabled(model.busy)
+                    .help(model.enabled ? "앱별 중계 끄기 (호스트 규칙은 그대로)" : "앱별 중계 켜기")
+                }
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if model.busy { ProgressView().controlSize(.small) }
+                    Button(action: pickApp) { Label("앱 추가", systemImage: "plus") }
+                        .help("앱 추가…").disabled(model.busy)
+                    Menu {
+                        Button("상태 새로고침") { Task { await model.refresh() } }
+                        Button("시스템 설정 열기") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences")!) }
+                        Divider()
+                        Button("프록시 구성 및 확장 제거…", role: .destructive) { confirmRemove = true }
+                    } label: { Label("더 보기", systemImage: "ellipsis.circle") }
+                    .disabled(model.busy)
+                }
+            }
         }
         .frame(minWidth: 760, minHeight: 560)
+        .onReceive(AppModel.shared.$pendingSplitApp) { url in
+            // 라우팅 보기에서 "앱별 스플리팅에 추가…"로 연 앱
+            guard let url else { return }
+            AppModel.shared.pendingSplitApp = nil
+            choose(url)
+        }
         .onChange(of: selection) { _, value in
             if value == nil && newRule { return }
             draft = model.config.rules.first { $0.id == value }; newRule = false
@@ -278,32 +311,76 @@ struct AppRulesView: View {
             Button("제거", role: .destructive) { Task { await model.turnOff(remove: true) } }
         }
     }
+
+    private var detailTitle: String {
+        if selection == Self.othersTag { return "규칙 없는 앱" }
+        return draft.map { $0.name.isEmpty ? $0.signingID : $0.name } ?? "앱별 스플리팅"
+    }
+
+    /// "켜짐 · 확장 허용됨 · 연결 3 · 중계 120 · 차단 2"
+    private var statusLine: String {
+        var parts = [model.connected ? "켜짐" : model.enabled ? "켜는 중" : "꺼짐", "확장 \(model.extensionState)"]
+        if model.connected {
+            parts += ["연결 \(model.report.active)", "중계 \(model.report.accepted)", "차단 \(model.report.blocked)"]
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func noteBand(_ note: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.statusWarn)
+            Text(note).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button { model.note = nil } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)) }
+                .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("닫기")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.statusWarn.opacity(0.12)))
+        .padding(.horizontal, 20).padding(.top, 12)
+    }
+
     /// "Only chosen apps use the VPN": while a VPN holds the default route, apps without a rule leave through Wi-Fi.
-    private var othersBar: some View {
+    private var othersForm: some View {
         let others = model.config.others ?? OthersPolicy()
         let save: (OthersPolicy) -> Void = { value in var next = model.config; next.others = value; Task { await model.save(next) } }
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Toggle("VPN이 켜져 있으면 규칙 없는 앱은", isOn: Binding(get: { others.enabled }, set: { var o = others; o.enabled = $0; save(o) }))
-                Picker("", selection: Binding(get: { others.exits.first ?? "wifi" }, set: { var o = others; o.exits = [$0]; save(o) })) {
+        return Form {
+            Section {
+                Toggle("VPN이 켜져 있으면 다른 출구로 보내기", isOn: Binding(get: { others.enabled }, set: { var o = others; o.enabled = $0; save(o) }))
+                Picker("출구", selection: Binding(get: { others.exits.first ?? "wifi" }, set: { var o = others; o.exits = [$0]; save(o) })) {
                     ForEach(["wifi", "wired", "tether"], id: \.self) { Text(Exits.label($0)).tag($0) }
-                }.labelsHidden().fixedSize().disabled(!others.enabled)
-                Text("으로 보내기")
-                Spacer()
+                }
+                .disabled(!others.enabled)
+            } footer: {
+                Text("VPN 출구를 정한 앱만 VPN으로. DNS는 그대로.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Text("켜면 'VPN' 출구를 지정한 앱만 VPN을 쓰고, 나머지 앱은 VPN 대신 고른 출구로 나가요. DNS 조회와 다른 VPN·Tailscale 경로는 그대로예요. 출구가 없으면 평소 경로(VPN)를 써요.")
-                .font(.caption).foregroundStyle(.secondary)
-        }.padding(.horizontal, 16).padding(.bottom, 10).disabled(model.busy)
+        }
+        .formStyle(.grouped).disabled(model.busy)
     }
+
     private func binding<T>(_ path: WritableKeyPath<SplitRule, T>) -> Binding<T> {
         Binding(get: { draft![keyPath: path] }, set: { draft?[keyPath: path] = $0 })
     }
+
     private var editor: some View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    TextField("앱 이름", text: binding(\.name))
-                    Toggle("이 앱 규칙 사용", isOn: binding(\.enabled))
+                    // Little Snitch 의 인스펙터처럼 맨 위에 앱 아이콘과 이름
+                    HStack(spacing: 12) {
+                        AppIcon(signingID: draft!.signingID, size: 38)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(draft!.name.isEmpty ? draft!.signingID : draft!.name).font(.title3.bold())
+                            Text(draft!.exits.isEmpty ? "모든 연결을 막아요" : draft!.exits.map(Exits.label).joined(separator: " → ") + " · 없으면 " + (draft!.fallback == "system" ? "평소 경로" : "차단"))
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Toggle("이 앱 규칙 사용", isOn: binding(\.enabled)).toggleStyle(.switch).labelsHidden().help("이 앱 규칙 사용")
+                    }
+                    .padding(.vertical, 4)
+                }
+                Section {
+                    TextField("이름", text: binding(\.name))
                     Toggle("같은 제작자의 보조 프로세스도 포함", isOn: binding(\.helpers)).disabled(draft?.teamID.isEmpty == true)
                     DisclosureGroup("앱 식별 정보") {
                         LabeledContent("서명 ID", value: draft!.signingID)
@@ -313,37 +390,55 @@ struct AppRulesView: View {
                 Section("출구 순위") {
                     if draft!.exits.isEmpty { Text("출구 없음 — 이 앱의 연결을 차단해요").foregroundStyle(.secondary) }
                     ForEach(Array(draft!.exits.enumerated()), id: \.element) { index, name in
-                        HStack {
-                            Text("\(index + 1). \(Exits.label(name))")
+                        HStack(spacing: 10) {
+                            Text("\(index + 1)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary).frame(width: 12)
+                            ExitBadge(name: name, size: 24)
+                            Text(Exits.label(name))
                             Spacer()
-                            Button { draft!.exits.swapAt(index, index - 1) } label: { Image(systemName: "chevron.up") }.disabled(index == 0)
-                            Button { draft!.exits.swapAt(index, index + 1) } label: { Image(systemName: "chevron.down") }.disabled(index == draft!.exits.count - 1)
-                            Button { draft!.exits.remove(at: index) } label: { Image(systemName: "minus.circle") }
-                        }.buttonStyle(.borderless)
+                            if draft!.exits.count > 1 {
+                                Button { draft!.exits.swapAt(index, index - 1) } label: { Image(systemName: "chevron.up") }
+                                    .disabled(index == 0).help("위로")
+                                Button { draft!.exits.swapAt(index, index + 1) } label: { Image(systemName: "chevron.down") }
+                                    .disabled(index == draft!.exits.count - 1).help("아래로")
+                            }
+                            Button { draft!.exits.remove(at: index) } label: { Image(systemName: "minus.circle.fill") }
+                                .foregroundStyle(.secondary).help("출구 빼기")
+                        }
+                        .buttonStyle(.borderless)
                     }
-                    Menu("출구 추가") {
+                    Menu {
                         ForEach(candidates.filter { !draft!.exits.contains($0) }, id: \.self) { name in Button(Exits.label(name)) { draft!.exits.append(name) } }
-                    }.disabled(draft!.exits.count >= 6)
+                    } label: { Label("출구 추가", systemImage: "plus") }
+                    .menuStyle(.borderlessButton).fixedSize().disabled(draft!.exits.count >= 6)
                 }
                 Section {
                     Picker("출구가 없을 때", selection: binding(\.fallback)) {
                         Text("차단").tag("block"); Text("평소 시스템 경로").tag("system")
                     }
-                    Text("연결 중인 출구가 끊기거나 규칙이 바뀌면 기존 중계 연결을 닫아요. 앱이 다시 연결할 때 출구 순위를 적용해요.")
+                } footer: {
+                    Text("이미 열린 연결은 앱을 다시 열어야 바뀌어요.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if !model.report.exits.isEmpty {
-                    Section("지금 사용 가능한 출구") {
-                        ForEach(model.report.exits, id: \.iface) { exit in Text(exit.label + (exit.healthy ? "" : " · 응답 없음")) }
+                    Section("지금 쓸 수 있는 출구") {
+                        ForEach(model.report.exits, id: \.iface) { exit in
+                            HStack {
+                                Text(exit.label)
+                                Spacer()
+                                if !exit.healthy { Text("응답 없음").foregroundStyle(Color.statusWarn) }
+                            }
+                        }
                     }
                 }
             }.formStyle(.grouped).disabled(model.busy)
+            Divider()
             HStack {
                 if !newRule {
                     Button("규칙 삭제", role: .destructive) {
                         var next = model.config; next.rules.removeAll { $0.id == draft!.id }
                         Task { await model.save(next); if model.note == nil { draft = nil; selection = nil } }
                     }
+                    .buttonStyle(.borderless).foregroundStyle(Color.statusError)
                 }
                 Spacer()
                 Button(newRule ? "추가" : "저장") {
@@ -352,21 +447,75 @@ struct AppRulesView: View {
                     else { next.rules.append(draft!) }
                     let id = draft!.id
                     Task { await model.save(next); if model.note == nil { selection = id; newRule = false } }
-                }.buttonStyle(.borderedProminent)
-            }.padding(12).disabled(model.busy)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!newRule && draft == model.config.rules.first { $0.id == draft?.id })
+            }
+            .padding(.horizontal, 20).padding(.vertical, 12).disabled(model.busy)
         }
     }
+
     private func pickApp() {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.applicationBundle]
         panel.directoryURL = URL(fileURLWithPath: "/Applications"); panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false; panel.treatsFilePackagesAsDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        choose(url)
+    }
+
+    /// 고른 앱: 이미 규칙이 있으면 그 규칙을, 없으면 새 규칙 초안을 연다
+    private func choose(_ url: URL) {
         do {
             let rule = try SplitControl.selectedApp(url)
             if let existing = model.config.rules.first(where: { $0.signingID == rule.signingID && $0.teamID == rule.teamID }) {
                 selection = existing.id; draft = existing; newRule = false
             } else { selection = nil; draft = rule; newRule = true }
         } catch { model.note = error.localizedDescription }
+    }
+}
+
+/// 앱 규칙 목록의 한 줄: 앱 아이콘 + 이름 + 출구 순위, 오른쪽에 켜기 상자.
+struct AppRuleListItem: View {
+    let rule: SplitRule
+    let setEnabled: (Bool) -> Void
+
+    var body: some View {
+        HStack(spacing: 9) {
+            AppIcon(signingID: rule.signingID, size: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(rule.name.isEmpty ? rule.signingID : rule.name).lineLimit(1)
+                    .foregroundStyle(rule.enabled ? .primary : .secondary)
+                Text(rule.enabled ? (rule.exits.isEmpty ? "차단" : rule.exits.map(Exits.label).joined(separator: " → ")) : "꺼짐")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Toggle("", isOn: Binding(get: { rule.enabled }, set: setEnabled))
+                .toggleStyle(.checkbox).labelsHidden().help(rule.enabled ? "이 앱 규칙 끄기" : "이 앱 규칙 켜기")
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// 서명 ID(= 대개 번들 ID)로 찾은 앱 아이콘. 못 찾으면 빈 앱 기호.
+struct AppIcon: View {
+    let signingID: String
+    var size: CGFloat = 22
+    private static var cache: [String: NSImage] = [:]
+
+    var body: some View {
+        if let image = Self.icon(signingID) {
+            Image(nsImage: image).resizable().interpolation(.high).frame(width: size, height: size)
+        } else {
+            Image(systemName: "app.dashed").font(.system(size: size * 0.7)).foregroundStyle(.secondary).frame(width: size, height: size)
+        }
+    }
+
+    private static func icon(_ id: String) -> NSImage? {
+        if let hit = cache[id] { return hit }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return nil }
+        let image = NSWorkspace.shared.icon(forFile: url.path)
+        cache[id] = image
+        return image
     }
 }
 

@@ -9,8 +9,22 @@ import SwiftUI
 struct RulesWindow: View {
     @EnvironmentObject var m: AppModel
     @Environment(\.openWindow) private var openWindow
+    @State private var search = ""
 
     private var rules: [Rule] { m.config?.rules ?? [] }
+    /// 검색어가 이름·대상·출구·조건에 들어간 규칙 (Little Snitch 의 규칙 검색처럼). 순서는 그대로.
+    private var shownRules: [Rule] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return rules }
+        return rules.filter { r in
+            ([r.name, r.when.text, r.settingsText] + r.targets).contains { $0.lowercased().contains(q) }
+        }
+    }
+    private var listHeader: String {
+        if !search.trimmingCharacters(in: .whitespaces).isEmpty { return "검색 결과 \(shownRules.count)개" }
+        let on = rules.filter(\.enabled).count
+        return rules.isEmpty ? "규칙" : "규칙 \(rules.count)개 · \(on)개 켜짐 · 위에서부터"
+    }
     private var profiles: [(String, NetProfile)] { (m.config?.profiles ?? [:]).sorted { $0.key < $1.key } }
 
     private var detailTitle: String {
@@ -24,10 +38,11 @@ struct RulesWindow: View {
     var body: some View {
         NavigationSplitView {
             List(selection: $m.windowSelection) {
-                Section("규칙 · 위에서부터") {
-                    ForEach(rules, id: \.id) { r in
+                Section(listHeader) {
+                    ForEach(shownRules, id: \.id) { r in
                         RuleListItem(rule: r, status: m.status?.rules.first { $0.id == r.id },
-                                     shadowedBy: m.shadowedBy(r), dirty: m.drafts["rule:" + r.id]?.isDirty == true)
+                                     shadowedBy: m.shadowedBy(r), dirty: m.drafts["rule:" + r.id]?.isDirty == true,
+                                     canToggle: m.engineReady && !m.busy) { on in Task { await m.setEnabled(r.id, on) } }
                             .tag("rule:" + r.id)
                             .contextMenu {
                                 Button(r.enabled ? "끄기" : "켜기") { Task { await m.setEnabled(r.id, !r.enabled) } }
@@ -35,19 +50,21 @@ struct RulesWindow: View {
                                 Button("삭제", role: .destructive) { Task { await m.remove(r.id) } }
                             }
                     }
-                    .onMove { from, to in
+                    // 검색 중에는 보이는 줄이 전체 순서와 달라 끌어서 옮기지 않는다.
+                    .onMove(perform: search.isEmpty ? { from, to in
                         guard let i = from.first else { return }
                         let id = rules[i].id
                         let dest = to > i ? to - 1 : to
                         Task { await m.move(id, String(dest + 1)) }
-                    }
+                    } : nil)
                 }
                 Section("네트워크 프로필") {
                     ForEach(profiles, id: \.0) { name, p in
                         HStack(spacing: 8) {
                             ZStack {
-                                Circle().fill(m.profileHere(name) ? Color.green : Color.secondary.opacity(0.45))
-                                Image(systemName: "location.fill").font(.system(size: 10, weight: .semibold)).foregroundStyle(.white)
+                                Circle().fill(m.profileHere(name) ? Color.solidFill : Color.secondary.opacity(0.15))
+                                Image(systemName: "location.fill").font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(m.profileHere(name) ? Color.onSolidFill : Color.secondary)
                             }.frame(width: 22, height: 22)
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(name)
@@ -60,7 +77,8 @@ struct RulesWindow: View {
                     if profiles.isEmpty { Text("없음 — + 메뉴로 지금 망 저장").font(.caption).foregroundStyle(.secondary) }
                 }
             }
-            .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+            .searchable(text: $search, placement: .sidebar, prompt: "규칙 검색")
+            .navigationSplitViewColumnWidth(min: 240, ideal: 280)
         } detail: {
             Group {
                 if let sel = m.windowSelection, sel.hasPrefix("rule:"), let i = rules.firstIndex(where: { "rule:" + $0.id == sel }) {
@@ -71,16 +89,16 @@ struct RulesWindow: View {
                     ProfileDetail(name: String(sel.dropFirst(8)), profile: p)
                 } else {
                     ContentUnavailableView("규칙을 고르세요", systemImage: "list.bullet.rectangle",
-                                           description: Text("왼쪽에서 규칙을 고르거나 + 로 새 규칙을 만드세요"))
+                                           description: Text("+ 로 새 규칙"))
                 }
             }
             .navigationTitle(detailTitle)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Button { NSApp.activate(ignoringOtherApps: true); openWindow(id: "app-rules") } label: {
+                    Button { NSApp.activate(); openWindow(id: "app-rules") } label: {
                         Label("앱별 스플리팅", systemImage: "app.connected.to.app.below.fill")
                     }.help("앱별 스플리팅")
-                    Button { NSApp.activate(ignoringOtherApps: true); openWindow(id: "routes") } label: {
+                    Button { NSApp.activate(); openWindow(id: "routes") } label: {
                         Label("라우팅 보기", systemImage: "point.3.connected.trianglepath.dotted")
                     }.help("라우팅 보기")
                     Menu {
@@ -96,11 +114,15 @@ struct RulesWindow: View {
     }
 }
 
+/// 규칙 목록의 한 줄. Little Snitch 의 규칙 목록처럼 오른쪽에 켜기 상자를 두고,
+/// 조건이 네트워크 프로필을 보면 그 프로필을 꼬리표로 붙인다.
 struct RuleListItem: View {
     let rule: Rule
     let status: RuleStatus?
     var shadowedBy: String? = nil
     var dirty = false
+    var canToggle = true
+    var setEnabled: (Bool) -> Void = { _ in }
 
     var body: some View {
         HStack(spacing: 9) {
@@ -109,16 +131,61 @@ struct RuleListItem: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
                     Text(rule.title).lineLimit(1).foregroundStyle(rule.enabled ? .primary : .secondary)
-                    if dirty { Circle().fill(Color.orange).frame(width: 6, height: 6).help("저장하지 않은 편집이 있어요") }
+                    if dirty { Circle().fill(Color.statusWarn).frame(width: 6, height: 6).help("저장하지 않은 편집이 있어요") }
                 }
                 if let by = shadowedBy {
-                    Text("⚠︎ \"\(by)\"에 가려짐").font(.caption).foregroundStyle(.orange).lineLimit(1)
+                    Text("\"\(by)\"에 가려짐").font(.caption).foregroundStyle(Color.statusWarn).lineLimit(1)
                 } else {
                     Text(rule.enabled ? rule.settingsText : "꺼짐").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
+            Spacer(minLength: 4)
+            ForEach(rule.when.profileNames, id: \.self) { p in
+                Text(p).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 0.5))
+                    .help("네트워크 프로필 \(p)에서만")
+            }
+            Toggle("", isOn: Binding(get: { rule.enabled }, set: setEnabled))
+                .toggleStyle(.checkbox).labelsHidden().disabled(!canToggle)
+                .help(rule.enabled ? "이 규칙 끄기" : "이 규칙 켜기")
         }
         .padding(.vertical, 2)
+    }
+}
+
+extension Condition {
+    /// 짧은 사람 말: "01:00–05:00", "사무실에서", "VPN 없을 때". 묶음은 조건 글 그대로.
+    var short: String {
+        switch self {
+        case .always: return "항상"
+        case .fact(let k, let v):
+            switch k {
+            case "time": return v.replacingOccurrences(of: "-", with: "–")
+            case "day": return v
+            case "profile": return "\(v)에서"
+            case "vpn": return v == "none" ? "VPN 없을 때" : v == "any" ? "VPN 있을 때" : "VPN:\(v)일 때"
+            case "link": return "\(Exits.label(v)) 있을 때"
+            case "default": return "기본 경로 \(Exits.label(v))"
+            case "vpnover": return "VPN이 \(Exits.label(v)) 위"
+            default: return text
+            }
+        case .not(.fact(let k, let v)) where k == "profile": return "\(v) 밖에서"
+        default: return text
+        }
+    }
+
+    /// 조건이 보는 네트워크 프로필 이름 (profile=… / profile!=…)
+    var profileNames: [String] {
+        switch self {
+        case .always: return []
+        case .fact(let k, let v): return k == "profile" ? [v] : []
+        case .not(let c): return c.profileNames
+        case .all(let cs), .any(let cs):
+            var out: [String] = []
+            for n in cs.flatMap(\.profileNames) where !out.contains(n) { out.append(n) }
+            return out
+        }
     }
 }
 
@@ -236,7 +303,7 @@ struct RuleForm: View {
                     Section {
                         HStack {
                             Label("이 규칙이 다른 곳(팝업·CLI)에서 바뀌었어요. 지금 보이는 건 고치던 내용이에요.", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(Color.statusWarn)
                             Spacer()
                             Button("다시 불러오기") { m.drafts[key] = RuleDraft(original) }
                         }
@@ -246,7 +313,7 @@ struct RuleForm: View {
                 if !notices.isEmpty {
                     Section {
                         ForEach(notices, id: \.self) { w in
-                            Label(w, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            Label(w, systemImage: "exclamationmark.triangle.fill").foregroundStyle(Color.statusWarn)
                         }
                     }
                 }
@@ -257,7 +324,7 @@ struct RuleForm: View {
                 Section {
                     exitsEditor
                 } header: { Text("출구 순위") } footer: {
-                    Text("쓸 수 있는 첫 출구로 보내고, 그 출구가 아닌 곳으로는 막아요.").font(.caption).foregroundStyle(.secondary)
+                    Text("첫 번째로 쓸 수 있는 출구로만").font(.caption).foregroundStyle(.secondary)
                 }
                 Section("동작") { behaviorEditor }
             }
@@ -336,7 +403,7 @@ struct RuleForm: View {
     private var targetError: String? {
         let t = newTarget.trimmingCharacters(in: .whitespaces)
         if t.isEmpty { return nil }
-        return Target.parse(t) == nil ? "IPv4, IPv4/프리픽스(8–32), 도메인만 넣을 수 있어요" : nil
+        return Target.parse(t) == nil ? "IPv4·대역(/8–32)·도메인만" : nil
     }
 
     @ViewBuilder private var targetsEditor: some View {
@@ -354,10 +421,10 @@ struct RuleForm: View {
             }
         }
         HStack {
-            Image(systemName: "plus").foregroundStyle(Color.accentColor)
-            TextField("", text: bind(\.newTarget), prompt: Text("IP, 대역, 도메인 추가 — Return"))
+            Image(systemName: "plus").foregroundStyle(.secondary)
+            TextField("", text: bind(\.newTarget), prompt: Text("IP·도메인 추가"))
                 .labelsHidden().textFieldStyle(.plain).onSubmit(addTarget)
-            if let e = targetError { Text(e).font(.caption).foregroundStyle(.red) }
+            if let e = targetError { Text(e).font(.caption).foregroundStyle(Color.statusError) }
         }
     }
 
@@ -372,7 +439,7 @@ struct RuleForm: View {
     private func exitDetail(_ e: String) -> (String, Color) {
         let ms = matchingExits(e, in: m.status?.exits ?? [])
         if let x = ms.first(where: { $0.healthy != false }) { return ("\(x.iface) · 연결됨", .secondary) }
-        if let x = ms.first { return ("\(x.iface) · 응답 없음", .orange) }
+        if let x = ms.first { return ("\(x.iface) · 응답 없음", .statusWarn) }
         return (m.exitAbsentReason(e) ?? "지금 없음", .secondary)
     }
 
@@ -438,18 +505,18 @@ struct RuleForm: View {
                 Text("키: vpn= link= profile= default= vpnover= time=09:00-18:00 day=mon-fri · 연산: = != and or not ( )")
                     .font(.caption).foregroundStyle(.secondary)
                 if case .success(let c) = condition, c.builder == nil, !c.isAlways {
-                    Text("이 조건은 빌더로 나타낼 수 없어 글로만 고칠 수 있어요.").font(.caption).foregroundStyle(.orange)
+                    Text("빌더로 못 나타내는 조건").font(.caption).foregroundStyle(Color.statusWarn)
                 }
             }
         }
-        if case .failure(let e) = condition { Text(e.description).font(.caption).foregroundStyle(.red) }
+        if case .failure(let e) = condition { Text(e.description).font(.caption).foregroundStyle(Color.statusError) }
         if mode != .always, let (_, f, _) = outcome, let dr = draft {
             Text(f.explain(dr.when)).font(.caption.monospaced()).foregroundStyle(.secondary)
         }
         TextField(text: bind(\.check), prompt: Text("비우면 출구 자체만 점검")) {
             VStack(alignment: .leading, spacing: 1) {
                 Text("상태 점검 대상")
-                Text("host:port 에 닿을 때만 그 출구를 써요").font(.caption).foregroundStyle(.secondary)
+                Text("host:port에 닿을 때만 그 출구").font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -475,10 +542,10 @@ struct RuleForm: View {
         HStack {
             if original != nil {
                 Button("규칙 삭제…", role: .destructive) { confirmDelete = true }
-                    .buttonStyle(.borderless).foregroundStyle(.red)
+                    .buttonStyle(.borderless).foregroundStyle(Color.statusError)
             }
             if !problems.isEmpty {
-                Text(problems.joined(separator: " · ")).font(.caption).foregroundStyle(.red).lineLimit(2)
+                Text(problems.joined(separator: " · ")).font(.caption).foregroundStyle(Color.statusError).lineLimit(2)
             }
             Spacer()
             if m.busy { ProgressView().controlSize(.small) }
@@ -577,7 +644,7 @@ struct RowEditor: View {
                     if !cs.contains(where: { $0.0 == row.value }) { Text(row.value.isEmpty ? "고르세요" : row.value).tag(row.value) }
                     ForEach(cs, id: \.0) { v, l in Text(l).tag(v) }
                 }.labelsHidden().frame(width: 150)
-                if row.key == "profile" && cs.isEmpty { Text("저장한 프로필이 없어요").font(.caption).foregroundStyle(.orange) }
+                if row.key == "profile" && cs.isEmpty { Text("저장한 프로필이 없어요").font(.caption).foregroundStyle(Color.statusWarn) }
             } else {
                 TextField(row.key == "time" ? "09:00-18:00" : "값", text: $row.value).textFieldStyle(.roundedBorder)
                     .font(.callout.monospaced()).frame(width: 150)
@@ -614,8 +681,9 @@ struct ProfileDetail: View {
             Section {
                 HStack(spacing: 12) {
                     ZStack {
-                        Circle().fill(m.profileHere(name) ? Color.green : Color.secondary.opacity(0.45))
-                        Image(systemName: "location.fill").font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
+                        Circle().fill(m.profileHere(name) ? Color.solidFill : Color.secondary.opacity(0.15))
+                        Image(systemName: "location.fill").font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(m.profileHere(name) ? Color.onSolidFill : Color.secondary)
                     }.frame(width: 38, height: 38)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(name).font(.title3.bold())
@@ -628,7 +696,7 @@ struct ProfileDetail: View {
                 LabeledContent("게이트웨이") { Text(profile.gateway).monospaced() }
                 LabeledContent("게이트웨이 MAC") { Text(profile.gatewayMac.isEmpty ? "(없음)" : profile.gatewayMac).monospaced() }
             } footer: {
-                Text("조건에 profile=\(name) 으로 쓰면, 이 링크가 이 게이트웨이(그리고 MAC)에 붙어 있을 때 참이 돼요.")
+                Text("조건에 profile=\(name)")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -636,7 +704,7 @@ struct ProfileDetail: View {
                     Button("프로필 삭제", role: .destructive) { Task { await m.removeProfile(name) } }
                 } else {
                     LabeledContent("쓰는 규칙", value: users.map(\.title).joined(separator: ", "))
-                    Text("이 규칙들의 조건에서 빼야 지울 수 있어요.").font(.caption).foregroundStyle(.secondary)
+                    Text("이 규칙들에서 빼야 지울 수 있어요").font(.caption).foregroundStyle(.secondary)
                 }
             }
         }

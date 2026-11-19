@@ -18,7 +18,7 @@ NAME="Wi-Fi Exit"
 APP="build/$NAME.app"
 
 mkdir -p build
-swiftc -target arm64-apple-macosx15.2 -O -swift-version 5 -parse-as-library engine.swift events.swift shared.swift conditions.swift -o build/wifi-exitd
+swiftc -target arm64-apple-macosx15.2 -O -swift-version 5 -parse-as-library engine.swift events.swift names.swift shared.swift conditions.swift -o build/wifi-exitd
 codesign --force --options runtime --timestamp --sign "$IDENTITY" --identifier com.miel.WifiExit.engine build/wifi-exitd
 export TEAM_ID="${TEAM_ID:-$(print -r -- "$IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')}"
 export APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"

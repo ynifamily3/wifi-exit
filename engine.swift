@@ -1125,7 +1125,8 @@ final class Daemon {
 
         signal(SIGTERM, SIG_IGN)
         let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        term.setEventHandler { log("daemon stopped"); exit(0) }
+        // 띄운 tcpdump 들도 같이 끝낸다 (데몬이 SIGPIPE 를 무시해 그 설정을 물려받은 tcpdump 는 읽는 쪽이 사라져도 남았다)
+        term.setEventHandler { EventHub.shared.shutdown(); log("daemon stopped"); exit(0) }
         term.resume()
         withExtendedLifetime(term) { dispatchMain() }
     }
