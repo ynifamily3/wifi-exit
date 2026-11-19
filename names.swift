@@ -174,14 +174,27 @@ enum NameSniff {
     }
 }
 
-/// 보는 사람이 있는 동안 tcpdump(-i pktap: 모든 인터페이스)로 이름을 읽어 표에 담는다. 새로 알았거나 바뀐 것만 onName 으로
+/// 보는 사람이 있는 동안 tcpdump 로 이름을 읽어 표에 담는다. 새로 알았거나 바뀐 것만 onName 으로.
+/// 주소가 있는 인터페이스(Wi-Fi·유선·테더링·VPN 터널)마다 tcpdump 를 하나씩 띄우고, 30초마다 새로 생긴 것을 더한다.
+/// 모든 인터페이스를 한 번에 잡는 pktap 은 거르개를 걸 수 없어("DLT 258 link-layer type filtering not implemented")
+/// 모든 패킷을 받아야 해서 쓰지 않는다. tcpdump 가 끝나면 까닭(오류 글)을 엔진 기록에 남긴다.
 final class NameSniffer {
     var onName: ((LearnedName) -> Void)?
     private let q: DispatchQueue
-    private var proc: Process?
-    private var buf = Data()
-    private var link: UInt32?
+    private var readers: [Reader] = []
+    private var running = false
+    private var refresh: DispatchSourceTimer?
     private var table: [String: (host: String, via: String, at: Date)] = [:]
+
+    /// tcpdump 하나와 그 출력 (pcap 흐름)
+    private final class Reader {
+        let iface: String
+        let proc = Process()
+        var buf = Data()
+        var link: UInt32?
+        var err = Data()
+        init(_ iface: String) { self.iface = iface }
+    }
 
     init(queue: DispatchQueue) { q = queue }
 
@@ -189,52 +202,109 @@ final class NameSniffer {
     var known: [LearnedName] { table.map { LearnedName(ip: $0.key, host: $0.value.host, via: $0.value.via) } }
 
     func start() {
-        guard proc == nil else { return }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/sbin/tcpdump")
-        p.arguments = ["-n", "-U", "-s", "2048", "-i", "pktap", "-w", "-", NameSniff.filter]
-        let pipe = Pipe(), err = Pipe()
-        p.standardOutput = pipe
-        p.standardError = err
-        buf = Data(); link = nil
-        // 거르개를 못 받거나 pktap 을 못 열면 바로 끝난다: 까닭을 엔진 기록에 남긴다
-        p.terminationHandler = { [weak self] t in
-            let msg = String(decoding: err.fileHandleForReading.availableData, as: UTF8.self)
-                .split(separator: "\n").filter { !$0.contains("listening on") && !$0.contains("packets") }.joined(separator: " / ")
-            self?.q.async {
-                guard self?.proc === t else { return }
-                self?.proc = nil
-                log("names: tcpdump ended (\(t.terminationStatus)) \(msg)")
-            }
-        }
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let d = h.availableData
-            if d.isEmpty { h.readabilityHandler = nil; return }
-            self?.q.async { self?.consume(d) }
-        }
-        do { try p.run(); proc = p; log("names: reading DNS and TLS names") } catch { log("names: tcpdump failed: \(error)") }
+        guard !running else { return }
+        running = true
+        addPerInterface()
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + 30, repeating: 30)
+        t.setEventHandler { [weak self] in self?.addPerInterface() }
+        t.resume()
+        refresh = t
     }
 
     func stop() {
-        proc?.terminate(); proc = nil
+        running = false
+        refresh?.cancel(); refresh = nil
+        readers.forEach { $0.proc.terminate() }
+        readers.removeAll()
         table.removeAll()
     }
 
-    private func consume(_ d: Data) {
-        buf.append(d)
-        if link == nil {
-            guard buf.count >= 24 else { return }
-            let h = [UInt8](buf.prefix(24))
-            link = NameSniff.u32le(h, 20)                     // pcap 전역 머리의 링크 종류 (이 Mac 의 바이트 순서)
-            buf.removeFirst(24)
+    private func addPerInterface() {
+        guard running else { return }
+        let have = Set(readers.map(\.iface))
+        for i in Self.liveInterfaces() where !have.contains(i) { launch(i) }
+    }
+
+    /// 주소가 있는 켜진 인터페이스 (Wi-Fi·유선·테더링·VPN 터널). 링크 로컬 IPv6(fe80::)만 있는 시스템 터널은 뺀다
+    static func liveInterfaces() -> [String] {
+        var out = Set<String>()
+        var ifs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifs) == 0 else { return [] }
+        defer { freeifaddrs(ifs) }
+        var p = ifs
+        while let cur = p {
+            let flags = Int32(cur.pointee.ifa_flags)
+            let name = String(cString: cur.pointee.ifa_name)
+            var usable = false
+            if let a = cur.pointee.ifa_addr {
+                if a.pointee.sa_family == UInt8(AF_INET) { usable = true }
+                if a.pointee.sa_family == UInt8(AF_INET6) {
+                    let b = a.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr.__u6_addr.__u6_addr8 }
+                    usable = !(b.0 == 0xfe && b.1 & 0xc0 == 0x80)
+                }
+            }
+            if usable, flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0,
+               ["en", "utun", "ppp", "ipsec", "bridge"].contains(where: { name.hasPrefix($0) }) {
+                out.insert(name)
+            }
+            p = cur.pointee.ifa_next
         }
-        while buf.count >= 16 {
-            let incl = Int(NameSniff.u32le([UInt8](buf.prefix(16)), 8))
-            guard incl < 1 << 20 else { stop(); return }          // 흐름이 어긋났다
-            guard buf.count >= 16 + incl else { return }
-            let rec = [UInt8](buf[buf.startIndex + 16 ..< buf.startIndex + 16 + incl])
-            buf.removeFirst(16 + incl)
-            for n in NameSniff.names(in: rec, linkType: link ?? 0) { learn(n) }
+        return out.sorted()
+    }
+
+    private func launch(_ iface: String) {
+        let r = Reader(iface)
+        r.proc.executableURL = URL(fileURLWithPath: "/usr/sbin/tcpdump")
+        r.proc.arguments = ["-n", "-U", "-s", "2048", "-i", iface, "-w", "-", NameSniff.filter]
+        let out = Pipe(), err = Pipe()
+        r.proc.standardOutput = out
+        r.proc.standardError = err
+        out.fileHandleForReading.readabilityHandler = { [weak self, weak r] h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            self?.q.async { if let r { self?.consume(r, d) } }
+        }
+        // 오류 글은 따로 모아 둔다 (끝난 뒤에 기다려 읽으면 멈출 수 있다)
+        err.fileHandleForReading.readabilityHandler = { [weak self, weak r] h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            self?.q.async { r?.err.append(d) }
+        }
+        r.proc.terminationHandler = { [weak self, weak r] t in
+            self?.q.asyncAfter(deadline: .now() + 0.2) {
+                guard let self, let r, self.running, self.readers.contains(where: { $0 === r }) else { return }
+                self.readers.removeAll { $0 === r }
+                let msg = String(decoding: r.err, as: UTF8.self).split(separator: "\n")
+                    .filter { !$0.contains("listening on") && !$0.contains("packets") }.joined(separator: " / ")
+                // 인터페이스가 사라지면 끝난다 (다시 생기면 30초 안에 다시 띄운다)
+                log("names: tcpdump -i \(r.iface) ended (\(t.terminationStatus)) \(msg)")
+            }
+        }
+        do {
+            try r.proc.run()
+            readers.append(r)
+            log("names: reading DNS and TLS names (-i \(iface))")
+        } catch {
+            log("names: tcpdump -i \(iface) failed: \(error)")
+        }
+    }
+
+    private func consume(_ r: Reader, _ d: Data) {
+        r.buf.append(d)
+        if r.link == nil {
+            guard r.buf.count >= 24 else { return }
+            let h = [UInt8](r.buf.prefix(24))
+            r.link = NameSniff.u32le(h, 20)                   // pcap 전역 머리의 링크 종류 (이 Mac 의 바이트 순서)
+            r.buf.removeFirst(24)
+        }
+        while r.buf.count >= 16 {
+            let incl = Int(NameSniff.u32le([UInt8](r.buf.prefix(16)), 8))
+            guard incl < 1 << 20 else { r.proc.terminate(); return }      // 흐름이 어긋났다
+            guard r.buf.count >= 16 + incl else { return }
+            let rec = [UInt8](r.buf[r.buf.startIndex + 16 ..< r.buf.startIndex + 16 + incl])
+            r.buf.removeFirst(16 + incl)
+            for n in NameSniff.names(in: rec, linkType: r.link ?? 0) { learn(n) }
         }
     }
 

@@ -106,7 +106,7 @@ wifi-exit apps remove                  # 프록시 구성·확장 제거
 | `outside.swift` | 라우팅 보기의 "전체" 범위: 연결 표(netstat. macOS 27 처럼 앱이 띄운 netstat 에 표가 비어 보이면 nettop)를 1초마다 훑어 규칙 밖 연결의 열림·오감(받은/보낸 바이트 증가, 패킷 수는 1200바이트당 1개로 어림)·닫힘을 찾고, 역방향 조회로 이름을 붙임. 규칙 밖 연결은 목적지 등록 도메인(없으면 IP)마다 줄을 따로 두고(최대 8개, 넘치면 "그 밖의 목적지" 한 줄, 90초 조용하면 뺀다) |
 | `routes_quick.swift` | 라우팅 보기에서 바로 규칙 만들기: 규칙 밖 목적지 줄을 누르면 그 목적지로 간 IP(원하면 /24 대역)·출구 순위·출구가 없을 때·이름을 그 자리에서 골라 추가하고("자세히…"는 규칙 창으로), 앱 칸을 누르면 그 앱이 간 곳을 골라 규칙으로 만들거나 앱별 스플리팅에 넣는다. IP → 나라(`GeoIP`) |
 | `events.swift` | 연결 사건 흐름: `watch` 중에만 pf 기록을 켜고, pflog 를 해석해 열림·막힘을, `pfctl -vss` 계수기를 0.5초마다 읽어 오감(패킷·바이트 차이)·닫힘을 `/var/run/wifi-exit/events.sock` 으로 보냄. 한 연결의 사건은 열림 → 오감 → 닫힘 순서를 지킨다 (엔진에 들어감) |
-| `names.swift` | 연결 이름 알아내기: `watch` 중에만 `tcpdump -i pktap` 으로 DNS 응답(질문 이름 ↔ A·AAAA)과 443 으로 가는 TLS ClientHello 의 SNI 를 읽어 IP → 이름 표를 메모리에 두고(30분, 4096개) 사건 소켓으로 보낸다. 라우팅 보기는 이 이름을 역방향 조회보다 먼저 쓴다. 암호화된 DNS·ECH 면 보이지 않는다 (엔진에 들어감) |
+| `names.swift` | 연결 이름 알아내기: `watch` 중에만 주소가 있는 인터페이스마다 `tcpdump` 를 하나씩 띄워(pktap 은 거르개를 걸 수 없어 쓰지 않는다) DNS 응답(질문 이름 ↔ A·AAAA)과 443 으로 가는 TLS ClientHello 의 SNI 를 읽어 IP → 이름 표를 메모리에 두고(30분, 4096개) 사건 소켓으로 보낸다. 라우팅 보기는 이 이름을 역방향 조회보다 먼저 쓴다. 암호화된 DNS·ECH 면 보이지 않는다 (엔진에 들어감) |
 | `app_rules.swift`, `app_policy.swift`, `apprules/` | 앱별 스플리팅 편집·제어·서명 식별·출구 결정과 TCP/UDP 투명 프록시 시스템 확장. 본 앱에 함께 포함한다 |
 | `icon/` | 앱 아이콘을 코드로 그리는 `make_icon.swift`와 `make_icns.sh` |
 | `geo/` | 나라 표시용 `ipv4-country.bin`과 그것을 만드는 `make_geo.sh`·`make_geo.swift`. 원본은 DB-IP 의 무료 "IP to Country Lite"(CC BY 4.0, IP Geolocation by [DB-IP](https://db-ip.com)). 달마다 `geo/make_geo.sh`로 새로 만들 수 있다 |
