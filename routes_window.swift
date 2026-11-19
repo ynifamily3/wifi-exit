@@ -1717,15 +1717,27 @@ struct RoutesWindow: View {
         path.strokedPath(StrokeStyle(lineWidth: 12, lineCap: .round)).contains(p)
     }
 
-    /// 점 p 에서 강조할 경로와 설명. 순서: 트래픽 막대 → 칸 → 묶음 제목 → 선
+    /// 마우스를 올린 앱 칸·규칙 밖 목적지 줄에만 보이는 + (규칙 만들기). 트래픽 칸 바로 왼쪽
+    private func plusRect(_ card: CGRect, inset: CGFloat) -> CGRect {
+        CGRect(x: card.maxX - inset - NodeToken.meter.width - 6 - 18, y: card.midY - 9, width: 18, height: 18)
+    }
+    private func canPlus(_ row: DiagramRow, _ g: DiagramGroup) -> Bool { g.rule == nil && !row.more }
+
+    private func drawPlus(_ c: inout GraphicsContext, _ r: CGRect, hot: Bool) {
+        c.draw(Text(Image(systemName: "plus.circle.fill")).font(.system(size: 15, weight: .regular))
+                .foregroundColor(fg.opacity(hot ? 0.85 : 0.5)), at: CGPoint(x: r.midX, y: r.midY))
+    }
+
+    /// 점 p 에서 강조할 경로와 설명. 순서: + → 트래픽 막대 → 칸 → 묶음 제목 → 선
     private func hoverTarget(_ p: CGPoint, size: CGSize) -> (PathFocus?, String?) {
         let L = layout(size)
         for a in visibleApps {
             guard let c = L.app[a] else { continue }
             let r = L.appRect(c)
             guard r.contains(p) else { continue }
+            if plusRect(r, inset: 10).insetBy(dx: -3, dy: -3).contains(p) { return (PathFocus(app: a), "규칙 만들기") }
             if meterRect(r, inset: 10).insetBy(dx: -3, dy: -3).contains(p) { return (PathFocus(app: a), meterTip("a:\(a)", title: a)) }
-            return (PathFocus(app: a), "\(a)\n누르면 간 곳으로 규칙 만들기")
+            return (PathFocus(app: a), nil)
         }
         for e in visibleExits {
             guard let c = L.exit[e.iface] else { continue }
@@ -1738,12 +1750,14 @@ struct RoutesWindow: View {
         for g in diagramGroups {
             for row in g.rows {
                 guard let r = L.rowRect(row.key), r.contains(p) else { continue }
+                if canPlus(row, g), plusRect(r, inset: NodeToken.inset).insetBy(dx: -3, dy: -3).contains(p) {
+                    return (PathFocus(row: row.key), "규칙 만들기")
+                }
                 if !row.more, meterRect(r).insetBy(dx: -3, dy: -3).contains(p) {
                     return (PathFocus(row: row.key), meterTip("w:\(row.key)", title: row.title))
                 }
                 var lines = [row.title]
                 if let cc = rowCountry(row) { lines.append("서버: \(countryName(cc))(\(cc))") }
-                if g.rule == nil && !row.more { lines.append("누르면 이 목적지로 규칙 만들기") }
                 return (PathFocus(row: row.key), row.more ? nil : lines.joined(separator: "\n"))
             }
             if let gr = L.group[g.key], CGRect(x: gr.minX, y: gr.minY - 10, width: gr.width, height: 20).contains(p) {
@@ -1847,6 +1861,9 @@ struct RoutesWindow: View {
         let L = layout(size)
         for (a, c) in L.app where L.appRect(c).contains(p) { return "a:" + a }
         for (i, c) in L.exit where L.nodeRect(c).contains(p) { return "x:" + i }
+        for g in diagramGroups where g.rule == nil {
+            for row in g.rows where !row.more { if let r = L.rowRect(row.key), r.contains(p) { return "w:" + row.key } }
+        }
         return nil
     }
 
@@ -2178,6 +2195,11 @@ struct RoutesWindow: View {
                                                               width: NodeToken.meter.width, height: NodeToken.meter.height))
                     right -= NodeToken.meter.width + 6
                 }
+                if canPlus(row, g) && hoverNode == "w:" + row.key {
+                    let pr = plusRect(rect, inset: NodeToken.inset)
+                    drawPlus(&rc, pr, hot: hoverTip?.text == "규칙 만들기")
+                    right = pr.minX - 8
+                }
                 let countText = blockRule || blocks > 0 && n == 0 ? (blocks > 0 ? "막힘 \(blocks)" : "") : n > 0 ? "\(n)" : ""
                 if !countText.isEmpty {
                     let t = rc.resolve(Text(countText).font(NodeToken.digits).foregroundColor(blockRule || n == 0 ? blockC.opacity(0.9) : muted))
@@ -2216,7 +2238,9 @@ struct RoutesWindow: View {
             c.opacity = (1 - 0.6 * dimAmt("a:" + a)) * ap
             c.translateBy(x: -10 * (1 - ap), y: 0)
             drawCard(&c, rect, shape: .app, tint: nil, state: live > 0 ? .active : .idle, selected: selected || quickApp == a)
-            let room = rect.width - 32 - 10 - NodeToken.meter.width - 6
+            let hovered = hoverNode == "a:" + a
+            let room = rect.width - 32 - 10 - NodeToken.meter.width - 6 - (hovered ? 24 : 0)
+            if hovered { drawPlus(&c, plusRect(rect, inset: 10), hot: hoverTip?.text == "규칙 만들기") }
             if let icon = scene.icons[a] {
                 c.draw(Image(nsImage: icon), in: CGRect(x: rect.minX + 9, y: p.y - 9, width: 18, height: 18))
                 c.draw(Text(fit(a, 12, .medium, false, room, .tail)).font(NodeToken.appTitle).foregroundColor(fg), at: CGPoint(x: rect.minX + 32, y: p.y), anchor: .leading)
@@ -2338,14 +2362,16 @@ struct RoutesWindow: View {
         }
     }
 
-    /// 앱을 누르면 간 곳으로 규칙 만들기, 규칙 밖 목적지를 누르면 그 자리에서 규칙 만들기, 규칙·출구는 강조
+    /// 앱 칸·규칙 밖 목적지 줄의 + 를 누르면 규칙 만들기 팝오버, 그 밖에는 누른 것을 강조
     private func tap(_ p: CGPoint, size: CGSize) {
         switch hitTest(p, size: size) {
         case .app(let a, let r):
-            quick = QuickPop(kind: .app(a), anchor: r, edge: .trailing)
+            if plusRect(r, inset: 10).insetBy(dx: -3, dy: -3).contains(p) {
+                quick = QuickPop(kind: .app(a), anchor: plusRect(r, inset: 10), edge: .trailing)
+            }
         case .row(let row, let g, let r):
-            if g.rule == nil && !row.more {
-                quick = QuickPop(kind: .rule(quickSeed(row)), anchor: r, edge: .leading)
+            if canPlus(row, g), plusRect(r, inset: NodeToken.inset).insetBy(dx: -3, dy: -3).contains(p) {
+                quick = QuickPop(kind: .rule(quickSeed(row)), anchor: plusRect(r, inset: NodeToken.inset), edge: .leading)
             } else {
                 focusRule = focusRule == row.slot ? nil : row.slot; focusExit = nil
             }
