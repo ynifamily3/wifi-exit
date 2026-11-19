@@ -55,6 +55,14 @@ final class EventHub {
         names.onName = { [weak self] n in self?.sendName(n) }
     }
 
+    /// 데몬이 끝날 때: 띄운 tcpdump 를 모두 끝낸다
+    func shutdown() {
+        q.sync {
+            reader?.terminate(); reader = nil
+            names.stop()
+        }
+    }
+
     private func sendName(_ n: LearnedName) {
         guard var d = try? JSONEncoder().encode(n) else { return }
         d.append(0x0a)
