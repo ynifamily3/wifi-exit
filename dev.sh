@@ -29,7 +29,7 @@ BUILD=build/dev
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 SOURCES=(app.swift rules_window.swift routes_window.swift outside.swift exit_reasons.swift ui_kit.swift
          shared.swift conditions.swift app_policy.swift app_identity.swift app_rules.swift popup.swift routes_quick.swift dev_sample.swift)
-ENGINE_SOURCES=(engine.swift events.swift shared.swift conditions.swift)
+ENGINE_SOURCES=(engine.swift events.swift names.swift shared.swift conditions.swift)
 
 # Only ever replace our own dev bundle, never the installed Wi-Fi Exit or anything else.
 remove_app() {

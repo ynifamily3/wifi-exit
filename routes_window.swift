@@ -314,8 +314,9 @@ final class EventStream: ObservableObject {
         while let nl = buffer.firstIndex(of: 0x0a) {
             let line = Data(buffer[buffer.startIndex..<nl])
             buffer.removeSubrange(buffer.startIndex...nl)
-            guard let e = try? JSONDecoder().decode(ConnEvent.self, from: line) else { continue }   // {"hello":1} 등
-            deliver(e)
+            if let e = try? JSONDecoder().decode(ConnEvent.self, from: line) { deliver(e); continue }
+            // 엔진이 DNS 응답·TLS SNI 에서 알아낸 이름 (역방향 조회보다 앞선다). {"hello":1} 등은 건너뛴다
+            if let n = try? JSONDecoder().decode(LearnedName.self, from: line) { names?.learn(n.ip, n.host, via: n.via) }
         }
     }
 
@@ -413,9 +414,11 @@ final class RouteScene {
     }
 
     /// 이름이 늦게 오면 그 IP 의 칸을 도메인 칸으로 옮긴다 (같은 목적지가 두 칸에 나뉘지 않게).
+    /// 역방향 조회 이름으로 이미 다른 칸(예: "~amazonaws.com")에 들어간 연결이면, 그 IP 로 가는 연결만 새 칸으로 옮긴다.
     func nameArrived(ip: String, name: String) {
         let from = "~" + ip, to = "~" + Self.registrable(name)
-        guard from != to, let i = outsideGroups.firstIndex(of: from) else { return }
+        guard from != to else { return }
+        guard let i = outsideGroups.firstIndex(of: from) else { moveIP(ip, to: to, name: name); return }
         if outsideGroups.contains(to) { outsideGroups.remove(at: i) } else { outsideGroups[i] = to }
         groupSeen[to] = max(groupSeen[to] ?? .distantPast, groupSeen[from] ?? .distantPast)
         groupLatest[to] = name
@@ -430,6 +433,23 @@ final class RouteScene {
         for (k, v) in heat where k.hasPrefix("o:\(from)|") { heat[k] = nil; heat["o:\(to)|" + k.split(separator: "|").last!] = v }
         for (k, v) in flash where k == "r:\(from)" { flash[k] = nil; flash["r:\(to)"] = v }
         hits = hits.map { $0.1 == "r:\(from)" ? ($0.0, "r:\(to)") : $0 }
+    }
+
+    /// IP 하나의 연결을 다른 목적지 칸으로 (다른 IP 가 남은 칸은 그대로 둔다)
+    private func moveIP(_ ip: String, to: String, name: String) {
+        let movers = flows.filter { $0.value.ev.outside == true && $0.value.ev.dst == ip && $0.value.slot != to }
+        guard !movers.isEmpty else { return }
+        if !outsideGroups.contains(to), outsideGroups.count < Self.maxGroups { outsideGroups.append(to) }
+        let toRow = outsideGroups.contains(to) ? to : "~+"
+        for (k, f) in movers {
+            groupIPs[f.slot]?.removeAll { $0 == ip }
+            flows[k]?.slot = to; flows[k]?.row = toRow
+        }
+        groupSeen[to] = Date()
+        groupLatest[to] = name
+        if !(groupIPs[to] ?? []).contains(ip) { groupIPs[to, default: []].append(ip) }
+        movers.values.forEach { groupExits[to, default: []].insert($0.iface) }
+        moving = true
     }
 
     /// 사건이 지나갈 칸
@@ -1758,6 +1778,9 @@ struct RoutesWindow: View {
                 }
                 var lines = [row.title]
                 if let cc = rowCountry(row) { lines.append("서버: \(countryName(cc))(\(cc))") }
+                if g.rule == nil, let ip = row.ips.last, let src = names.source(ip) {
+                    lines.append("이름: " + (src == "dns" ? "DNS 응답에서" : src == "sni" ? "TLS 접속 이름(SNI)에서" : "역방향 조회(PTR)에서"))
+                }
                 return (PathFocus(row: row.key), row.more ? nil : lines.joined(separator: "\n"))
             }
             if let gr = L.group[g.key], CGRect(x: gr.minX, y: gr.minY - 10, width: gr.width, height: 20).contains(p) {

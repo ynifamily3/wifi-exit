@@ -193,16 +193,29 @@ func shRun(_ path: String, _ args: [String]) -> String {
     return String(decoding: d, as: UTF8.self)
 }
 
-/// IP → 이름 (역방향 조회 PTR). 규칙 밖 연결은 평소 경로로 나가는 것이라 조회도 평소 경로로 간다.
-/// PTR 이름은 앱이 실제로 쓴 도메인과 다를 수 있다 (CDN 이름 등).
+/// IP → 이름. 먼저 엔진이 DNS 응답·TLS SNI 에서 알아낸 이름(앱이 실제로 쓴 이름, learn)을 쓰고,
+/// 없으면 역방향 조회(PTR)로 채운다. PTR 이름은 앱이 쓴 도메인과 다를 수 있다 (CDN 이름 등).
+/// 규칙 밖 연결은 평소 경로로 나가는 것이라 조회도 평소 경로로 간다.
 @MainActor
 final class HostNames: ObservableObject {
     @Published private(set) var names: [String: String] = [:]
     var onResolved: ((String, String) -> Void)?     // (IP, 이름) — 이름이 늦게 오면 IP 칸을 도메인 칸으로 합칠 때 쓴다
     private var asked = Set<String>()
+    private var learned: [String: String] = [:]     // IP → 어디서 알았나 (dns | sni)
     private let q = DispatchQueue(label: "wifi-exit.ptr", attributes: .concurrent)
 
     func name(_ ip: String) -> String? { names[ip] }
+    /// 이름을 어디서 알았나: "dns" · "sni" · "ptr" (역방향 조회)
+    func source(_ ip: String) -> String? { names[ip] == nil ? nil : learned[ip] ?? "ptr" }
+
+    /// 엔진이 알려 준 이름. 역방향 조회보다 앞서고, 칸을 다시 나눌 수 있게 알린다
+    func learn(_ ip: String, _ host: String, via: String) {
+        asked.insert(ip)                             // 이제 역방향 조회는 하지 않는다
+        learned[ip] = via
+        guard names[ip] != host else { return }
+        names[ip] = host
+        onResolved?(ip, host)
+    }
 
     func lookup(_ ip: String) {
         guard !asked.contains(ip) else { return }
@@ -216,7 +229,10 @@ final class HostNames: ObservableObject {
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             guard getnameinfo(r.pointee.ai_addr, r.pointee.ai_addrlen, &host, socklen_t(host.count), nil, 0, NI_NAMEREQD) == 0 else { return }
             let n = String(cString: host)
-            DispatchQueue.main.async { self.names[ip] = n; self.onResolved?(ip, n) }
+            DispatchQueue.main.async {
+                guard self.learned[ip] == nil else { return }       // 그사이 엔진이 알려 준 이름이 있으면 그것을 둔다
+                self.names[ip] = n; self.onResolved?(ip, n)
+            }
         }
     }
 }

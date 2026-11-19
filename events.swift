@@ -4,6 +4,7 @@
 //   1) state/logging 파일을 만들어 pf 앵커에 기록 줄을 넣게 한다 (apply 가 읽는다)
 //   2) pflog0 을 만들고 tcpdump -w - 로 pflog 를 받아 직접 해석한다
 //   3) 연결마다 JSON 한 줄을 붙어 있는 모두에게 보낸다
+//   4) DNS 응답·TLS SNI 에서 알아낸 IP 의 이름도 한 줄씩 보낸다 (names.swift)
 // 마지막으로 떨어지면 기록 줄을 빼고 pflog0 을 지운다. 디스크에는 사건을 남기지 않는다.
 
 import Darwin
@@ -24,6 +25,7 @@ final class EventHub {
     private var map: [PFLine] = []
     private var recent: [String: Date] = [:]     // 막힌 연결은 상태가 없어 재전송마다 기록된다. 2초 안의 같은 연결은 한 번만
     private var mapStamp: Date?
+    private lazy var names = NameSniffer(queue: q)
 
     // MARK: 소켓
 
@@ -50,6 +52,13 @@ final class EventHub {
         }
         src.resume()
         acceptSrc = src
+        names.onName = { [weak self] n in self?.sendName(n) }
+    }
+
+    private func sendName(_ n: LearnedName) {
+        guard var d = try? JSONEncoder().encode(n) else { return }
+        d.append(0x0a)
+        broadcast(d)
     }
 
     private func addClient(_ c: Int32) {
@@ -66,6 +75,12 @@ final class EventHub {
         log("watch: viewer connected (\(clients.count))")
         _ = write(c, "{\"hello\":1}\n", 12)
         if clients.count == 1 { setLogging(true) }
+        // 먼저 붙은 사람 덕에 이미 아는 이름: 새로 붙은 사람에게도
+        for n in names.known {
+            guard var d = try? JSONEncoder().encode(n) else { continue }
+            d.append(0x0a)
+            if d.withUnsafeBytes({ write(c, $0.baseAddress, d.count) }) < 0 { break }
+        }
     }
 
     private func drop(_ c: Int32) {
@@ -90,9 +105,11 @@ final class EventHub {
             run("/sbin/ifconfig", ["pflog0", "create"])        // 이미 있으면 실패해도 괜찮다
             startReader()
             startStatePoller()
+            names.start()
         } else {
             try? FileManager.default.removeItem(atPath: Paths.logging)
             reader?.terminate(); reader = nil
+            names.stop()
             statePoll?.cancel(); statePoll = nil
             lastStates.removeAll(); closedKeys.removeAll()
             q.asyncAfter(deadline: .now() + 3) {
