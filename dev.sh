@@ -28,7 +28,7 @@ DEV_ID=com.miel.WifiExit.dev
 BUILD=build/dev
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 SOURCES=(app.swift rules_window.swift routes_window.swift outside.swift exit_reasons.swift ui_kit.swift
-         shared.swift conditions.swift app_policy.swift app_identity.swift app_rules.swift popup.swift dev_sample.swift)
+         shared.swift conditions.swift app_policy.swift app_identity.swift app_rules.swift popup.swift routes_quick.swift dev_sample.swift)
 ENGINE_SOURCES=(engine.swift events.swift shared.swift conditions.swift)
 
 # Only ever replace our own dev bundle, never the installed Wi-Fi Exit or anything else.
@@ -94,6 +94,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 cp $BUILD/WifiExit "$APP/Contents/MacOS/WifiExit"
 cp -p $BUILD/wifi-exitd "$APP/Contents/Helpers/wifi-exitd"
 cp icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp geo/ipv4-country.bin "$APP/Contents/Resources/ipv4-country.bin"     # 라우팅 보기의 나라 표시 (geo/make_geo.sh)
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

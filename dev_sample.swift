@@ -54,6 +54,27 @@ enum DevSample {
             status?.paused = args[0] == "pause"
             config?.paused = args[0] == "pause"
             return ShellResult(code: 0, out: "", err: "")
+        case "add":
+            // 라우팅 보기의 빠른 규칙 추가를 표본에서도 해 볼 수 있게: 메모리의 표본에 규칙을 붙인다
+            func opt(_ k: String) -> String? { args.firstIndex(of: k).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+            let targets = (opt("--targets") ?? (args.count > 1 ? args[1] : "")).split(separator: ",").map(String.init)
+            guard !targets.isEmpty else { break }
+            let via = opt("--via") ?? "wifi"
+            let exitNames = via == "none" ? [] : via.split(separator: ",").map(String.init)
+            let elseAction = opt("--else") ?? "block"
+            let id = "q\((status?.rules.count ?? 0) + 1)"
+            let live = status?.exits ?? []
+            let chosen = exitNames.lazy.compactMap { n in matchingExits(n, in: live).first { $0.up }.map { (n, $0.iface) } }.first
+            let decision = chosen != nil ? "route" : elseAction == "block" ? "block" : elseAction
+            let ts = targets.map { t in
+                TargetStatus(target: t, kind: Target.parse(t)?.1 ?? .ip,
+                             addresses: [AddressStatus(ip: t, interface: chosen?.1 ?? "", pinned: chosen != nil, blocked: decision == "block", owner: nil, note: nil)])
+            }
+            status?.rules.append(RuleStatus(id: id, name: opt("--name") ?? "", enabled: true, exits: exitNames, elseAction: elseAction,
+                                            chosenExit: chosen?.0, chosenIface: chosen?.1, decision: decision, reason: "표본에 더한 규칙", targets: ts))
+            config?.rules.append(Rule(id: id, name: opt("--name") ?? "", targets: targets, exits: exitNames, elseAction: elseAction))
+            decisions[id] = decision
+            return ShellResult(code: 0, out: "id \(id)\n", err: "")
         default:
             break
         }

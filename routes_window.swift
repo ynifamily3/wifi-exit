@@ -44,6 +44,7 @@ final class EventStream: ObservableObject {
         let id: String
         let app: String, exe: String?, dst: String, dport: Int, proto: String
         let rule: String?, slot: String, iface: String, blocked: Bool, outside: Bool
+        var row = ""                             // 흐름도 오른쪽의 목적지 줄 (RouteScene.row(for:))
         var opens = 0, bytesOut = 0, bytesIn = 0
         var first: Int, last: Int
         var live = Set<String>()                 // 지금 열려 있는 연결 (flowKey)
@@ -54,7 +55,7 @@ final class EventStream: ObservableObject {
     private(set) var bins: [Int: Bin] = [:]      // 10초 칸 (t / 10_000)
     private var flowStat: [String: String] = [:]
     // 작은 트래픽 칸 (Little Snitch 처럼): 키마다 최근 12초를 2초 칸 6개로. 키 = a:앱, d:목적지, r:규칙, x:출구,
-    // re:규칙|출구(규칙 → 출구 선), b:앱|규칙|출구(연결 길)
+    // w:목적지 줄, ax:앱|출구(앱 → 출구 선), wx:줄|출구(출구 → 목적지 선), b:앱|줄|출구(연결 길)
     static let meterSlotMs = 2000, meterSlots = 6
     private(set) var meters: [String: [Int: Bin]] = [:]
     private(set) var meterPeak = 2048           // 칸 하나의 최댓값 (막대 높이 기준)
@@ -79,7 +80,7 @@ final class EventStream: ObservableObject {
             if dests[key] == nil {
                 dests[key] = DestStat(id: key, app: app, exe: e.exe, dst: e.dst, dport: e.dport, proto: e.proto, rule: e.rule,
                                       slot: scene.slot(for: e), iface: e.iface, blocked: act == "block", outside: e.outside == true,
-                                      first: e.t, last: e.t)
+                                      row: scene.row(for: e), first: e.t, last: e.t)
             }
             return key
         }
@@ -99,7 +100,8 @@ final class EventStream: ObservableObject {
             dests[key]?.last = e.t
             if let d = dests[key] {
                 let slot = e.t / Self.meterSlotMs
-                for k in ["a:\(d.app)", "d:\(key)", "r:\(d.slot)", "x:\(d.iface)", "re:\(d.slot)|\(d.iface)", "b:\(d.app)|\(d.slot)|\(d.iface)"] {
+                for k in ["a:\(d.app)", "d:\(key)", "r:\(d.slot)", "x:\(d.iface)", "w:\(d.row)", "ax:\(d.app)|\(d.iface)",
+                          "wx:\(d.row)|\(d.iface)", "b:\(d.app)|\(d.row)|\(d.iface)"] {
                     meters[k, default: [:]][slot, default: Bin()].out += e.bout ?? 0
                     meters[k, default: [:]][slot, default: Bin()].inn += e.bin ?? 0
                 }
@@ -118,6 +120,8 @@ final class EventStream: ObservableObject {
         // 3분 넘게 연결이 없는 앱 칸은 흐려지며 뺀다 (예전에는 7개가 넘어야만 빠져서 지난 앱이 계속 남았다)
         let liveApps = Set(dests.values.filter { !$0.live.isEmpty }.map(\.app))
         if scene.pruneApps(olderThan: 180, keep: liveApps) { animating = true }
+        let liveRows = Set(dests.values.filter { !$0.live.isEmpty }.map(\.row))
+        if scene.pruneGroups(olderThan: 90, keep: liveRows) { animating = true }
         if !meters.isEmpty { statsDirty = true }      // 트래픽 칸은 조용해져도 1초마다 한 칸씩 흘러가야 한다
         guard statsDirty else { return }
         statsDirty = false
@@ -156,6 +160,21 @@ final class EventStream: ObservableObject {
     func refreshSamplerContext() {
         let st = statusProvider()
         sampler.setContext(exits: st?.exits ?? [], managed: Set(st?.rules.flatMap { $0.addresses.map(\.ip) } ?? []))
+    }
+
+    /// 규칙을 처음 받거나 바뀌면 규칙 대상 표를 새로 하고, 이미 본 연결의 목적지 줄을 다시 맞춘다
+    /// (규칙보다 연결이 먼저 오면 모두 "그 밖의 주소"로 갔다)
+    func setRules(_ rules: [RuleStatus]) {
+        scene.setRules(rules)
+        for (k, f) in scene.flows where f.ev.outside != true {
+            let r = scene.row(rule: f.ev.rule, dst: f.ev.dst)
+            if r != f.row { scene.flows[k]?.row = r }
+        }
+        for (k, d) in dests where !d.outside {
+            let r = scene.row(rule: d.rule, dst: d.dst)
+            if r != d.row { dests[k]?.row = r }
+        }
+        animating = true
     }
 
     func setAllTraffic(_ on: Bool) {
@@ -321,6 +340,7 @@ final class RouteScene {
         var pos = CGPoint.zero
         var flashed = false
         var slot = ""                    // 지나갈 규칙 칸: 규칙 id, 또는 규칙 밖이면 "~<도메인|IP>"
+        var row = ""                     // 닿는 목적지 줄
         var dir = 0                      // 0 = 막힌 연결(규칙까지 가서 부서짐), 1 = 나가는 패킷, -1 = 들어오는 패킷
         var info = ""                    // 마우스를 올렸을 때 덧붙일 말 ("나감 3패킷 · 4.1KB")
     }
@@ -330,11 +350,12 @@ final class RouteScene {
         var key: String
         var app: String
         var slot: String
+        var row: String                      // 흐름도 오른쪽의 목적지 줄
         var iface: String
         var ev: ConnEvent
         var opened: Date
         var closedAt: Date?
-        var bundle: String { "\(app)|\(slot)|\(iface)" }
+        var bundle: String { "\(app)|\(row)|\(iface)" }
     }
     struct Spark { var p: CGPoint; var v: CGVector; var life: Double; var r: CGFloat }
 
@@ -349,7 +370,7 @@ final class RouteScene {
     static let openDuration = 0.6             // 길이 그려지는 시간
     static let closeFade = 0.8
 
-    /// 같은 (앱, 칸, 출구)를 쓰는 연결들 → 길 하나
+    /// 같은 (앱, 목적지 줄, 출구)를 쓰는 연결들 → 길 하나
     var bundles: [String: [Flow]] { Dictionary(grouping: flows.values, by: \.bundle) }
 
     func saveLiveFlows() { savedFlows = flows; flows.removeAll(); pending.removeAll() }
@@ -361,7 +382,8 @@ final class RouteScene {
     static func bytesText(_ b: Int) -> String { b >= 1_048_576 ? String(format: "%.1fMB", Double(b) / 1_048_576) : b >= 1024 ? String(format: "%.1fKB", Double(b) / 1024) : "\(b)B" }
     var sparks: [Spark] = []
     var heat: [String: Double] = [:]          // "r:<규칙>" / "a:<앱>|<규칙>" → 0…1.5
-    var hits: [(Date, String)] = []           // 최근 60초 지나간 것 (규칙·출구 숫자)
+    var hits: [(Date, String)] = []           // 최근 60초 지나간 것 (규칙·출구·줄 숫자)
+    var blockPairs: [String: Date] = [:]      // "앱|줄" → 마지막으로 막힌 때 (막힌 길 강조용)
     var apps: [String] = []                   // 왼쪽 기둥 (최근에 본 순서, 최대 7)
     var appSeen: [String: Date] = [:]
     var flash: [String: Double] = [:]         // 규칙 칸 반짝임
@@ -403,6 +425,8 @@ final class RouteScene {
         groupExits[to, default: []].formUnion(groupExits[from] ?? [])
         groupExits[from] = nil
         for c in caps.indices where caps[c].slot == from { caps[c].slot = to }
+        let toRow = outsideGroups.contains(to) ? to : "~+"
+        for (k, f) in flows where f.slot == from { flows[k]?.slot = to; flows[k]?.row = f.row == from ? toRow : f.row }
         for (k, v) in heat where k.hasPrefix("o:\(from)|") { heat[k] = nil; heat["o:\(to)|" + k.split(separator: "|").last!] = v }
         for (k, v) in flash where k == "r:\(from)" { flash[k] = nil; flash["r:\(to)"] = v }
         hits = hits.map { $0.1 == "r:\(from)" ? ($0.0, "r:\(to)") : $0 }
@@ -412,6 +436,149 @@ final class RouteScene {
     func slot(for e: ConnEvent) -> String {
         guard e.outside == true else { return e.rule ?? "?" }
         return "~" + (nameFor(e.dst).map(Self.registrable) ?? e.dst)
+    }
+
+    // MARK: 목적지 줄
+    // 오른쪽 기둥은 규칙마다 묶음 하나, 묶음 안에 대상(도메인·IP·대역)마다 줄 하나. 규칙 밖 연결은 "규칙 없음" 묶음에
+    // 목적지(등록 도메인, 없으면 IP)마다 줄 하나. 줄 열쇠: "t:<규칙>|<대상>", 넘친 대상 "t:<규칙>|+", 규칙 밖 "~<목적지>", 넘친 목적지 "~+"
+    struct RuleTargets { var targets: [(target: String, kind: TargetKind, ips: Set<String>)] }
+    var ruleTargets: [String: RuleTargets] = [:]
+    static let targetCap = 5                    // 규칙 묶음마다 보여 줄 대상 줄 (나머지는 "그 밖의 대상" 한 줄)
+
+    func setRules(_ rules: [RuleStatus]) {
+        var out: [String: RuleTargets] = [:]
+        for r in rules { out[r.id] = RuleTargets(targets: r.targets.map { ($0.target, $0.kind, Set($0.addresses.map(\.ip))) }) }
+        ruleTargets = out
+    }
+
+    /// 사건이 닿는 목적지 줄
+    func row(for e: ConnEvent) -> String {
+        if e.outside == true {
+            let s = slot(for: e)
+            return outsideGroups.contains(s) || outsideGroups.count < Self.maxGroups ? s : "~+"
+        }
+        return row(rule: e.rule, dst: e.dst)
+    }
+
+    /// 규칙 대상 줄: 그 규칙의 대상 중 이 주소를 맡은 것 (도메인은 풀린 주소, 대역은 포함)
+    func row(rule: String?, dst: String) -> String {
+        guard let id = rule else { return "t:?|+" }
+        guard let ts = ruleTargets[id]?.targets,
+              let i = ts.firstIndex(where: { $0.ips.contains(dst) || ($0.kind == .cidr && targetCovered(dst, by: $0.target)) })
+        else { return "t:\(id)|+" }
+        return i < Self.targetCap ? "t:\(id)|\(ts[i].target)" : "t:\(id)|+"
+    }
+
+    /// 줄 열쇠 → 묶음 열쇠 (규칙 id, 규칙 밖이면 "~")
+    static func group(ofRow r: String) -> String {
+        if r.hasPrefix("~") { return "~" }
+        return String(r.dropFirst(2).prefix { $0 != "|" })
+    }
+    /// 줄 열쇠 → 칸(slot): 규칙 id, 또는 규칙 밖 "~목적지"
+    static func slot(ofRow r: String) -> String { r.hasPrefix("~") ? r : group(ofRow: r) }
+
+    /// 3분(또는 age) 넘게 연결이 없는 규칙 밖 목적지 줄을 뺀다 (자리는 다음 정리 때 메운다)
+    func pruneGroups(olderThan age: TimeInterval, keep: Set<String>, now: Date = Date()) -> Bool {
+        let stale = outsideGroups.filter { !keep.contains($0) && now.timeIntervalSince(groupSeen[$0] ?? .distantPast) > age }
+        guard !stale.isEmpty else { return false }
+        outsideGroups.removeAll { stale.contains($0) }
+        for g in stale { groupExits[g] = nil }
+        moving = true
+        return true
+    }
+
+    // MARK: 붙박이 자리
+    // 칸은 한 번 놓이면 그 자리에 머문다. 새 앱은 이어진 출구들의 높이 근처 빈자리에 들어가고, 다른 칸은 움직이지 않는다.
+    // 빠진 칸의 빈자리와 어긋난 순서는 마우스를 올리지 않은 조용한 때에 한꺼번에 정리한다 (arrangeGap 마다 한 번까지).
+    var appY: [String: CGFloat] = [:]
+    var exitY: [String: CGFloat] = [:]          // 인터페이스(또는 "block") → 높이
+    var appExits: [String: [String: Date]] = [:] // 앱 → 쓴 출구(또는 "block") → 마지막으로 본 때
+    var lastArrange = Date.distantPast
+    var arrangedKey = ""                        // 정리할 때의 보이는 출구·묶음 (바뀌면 출구 자리를 바로 다시 잡는다)
+    var interacting = false                     // 마우스를 올렸거나 팝오버가 열려 있으면 정리하지 않는다
+    static let arrangeGap = 8.0
+
+    /// 칸들을 바라는 높이(이어진 칸들의 평균) 순으로 세우고, 간격을 지키며 바라는 높이에서 가장 덜 벗어나게 둔다:
+    /// 겹치는 이웃끼리 덩어리로 묶어 덩어리 가운데를 평균에 맞춘다. keepOrder 면 주어진 순서를 바꾸지 않는다.
+    static func place(_ ids: [String], want: [String: CGFloat], gap: CGFloat, top: CGFloat, keepOrder: Bool = false,
+                      current: [String: CGFloat] = [:]) -> [String: CGFloat] {
+        var order = ids
+        if !keepOrder {
+            // 바라는 높이가 반 칸 안쪽으로 비슷하면 지금 순서를 지킨다 (칸이 왔다 갔다 흔들리지 않게)
+            let band = gap / 2
+            order = ids.enumerated().sorted { a, b in
+                let wa = want[a.element].map { ($0 / band).rounded(.down) } ?? .greatestFiniteMagnitude
+                let wb = want[b.element].map { ($0 / band).rounded(.down) } ?? .greatestFiniteMagnitude
+                if wa != wb { return wa < wb }
+                let ca = current[a.element] ?? .greatestFiniteMagnitude, cb = current[b.element] ?? .greatestFiniteMagnitude
+                return ca != cb ? ca < cb : a.offset < b.offset
+            }.map(\.element)
+        }
+        var clusters: [(ids: [String], top: CGFloat)] = []
+        for id in order {
+            let fallback = clusters.last.map { $0.top + CGFloat($0.ids.count) * gap } ?? top
+            var c = (ids: [id], top: want[id] ?? fallback)
+            while let last = clusters.last, last.top + CGFloat(last.ids.count) * gap > c.top {
+                clusters.removeLast()
+                let merged = last.ids + c.ids
+                let tops = merged.enumerated().map { (want[$0.element] ?? (last.top + CGFloat($0.offset) * gap)) - CGFloat($0.offset) * gap }
+                c = (ids: merged, top: tops.reduce(0, +) / CGFloat(tops.count))
+            }
+            clusters.append(c)
+        }
+        var out: [String: CGFloat] = [:]
+        var floor = top
+        for c in clusters {
+            let t = max(c.top, floor)
+            for (i, id) in c.ids.enumerated() { out[id] = t + CGFloat(i) * gap }
+            floor = t + CGFloat(c.ids.count) * gap
+        }
+        return out
+    }
+
+    /// 앱이 바라는 높이: 최근 1분에 쓴 출구들의 높이 평균 (없으면 지금까지 쓴 출구 전부)
+    func appWant(_ app: String, now: Date = Date()) -> CGFloat? {
+        let used = appExits[app] ?? [:]
+        let recent = used.filter { now.timeIntervalSince($0.value) < 60 }.map(\.key)
+        let ys = (recent.isEmpty ? Array(used.keys) : recent).compactMap { exitY[$0] }
+        return ys.isEmpty ? nil : ys.reduce(0, +) / CGFloat(ys.count)
+    }
+
+    /// 보이는 칸에 자리를 준다. exitWant: 출구마다 바라는 높이 (이어진 목적지 줄들의 평균), exits: 바라는 높이가 같을 때의 순서
+    var arrangedZoom = ""
+    func arrange(apps: [String], exits: [String], exitWant: [String: CGFloat], key: String, zoomKey: String, top: CGFloat,
+                 appGap: CGFloat, exitGap: CGFloat, now: Date = Date()) {
+        let quiet = !interacting && now.timeIntervalSince(lastArrange) >= Self.arrangeGap
+        let exitsChanged = key != arrangedKey || exits.contains { exitY[$0] == nil }
+        if exitsChanged || quiet {
+            // 출구도 이어진 묶음의 높이 순으로 (규칙 순서와 출구 순서가 달라 선이 엇갈리지 않게). 이어진 것이 없는 출구는 아래로
+            let next = Self.place(exits, want: exitWant, gap: exitGap, top: top, current: exitY)
+            if next.contains(where: { abs((exitY[$0.key] ?? -999) - $0.value) > 1 }) { exitY = next; moving = true }
+            arrangedKey = key
+        }
+        // 빠진 앱의 자리는 비워 둔다 (다른 칸을 당기지 않는다)
+        appY = appY.filter { apps.contains($0.key) }
+        let zoomChanged = zoomKey != arrangedZoom
+        if zoomChanged || quiet {
+            arrangedZoom = zoomKey
+            let want = Dictionary(uniqueKeysWithValues: apps.compactMap { a in appWant(a, now: now).map { (a, $0) } })
+            let next = Self.place(apps, want: want, gap: appGap, top: top, current: appY)
+            if next.contains(where: { abs((appY[$0.key] ?? -999) - $0.value) > 1 }) { appY = next; moving = true }
+            lastArrange = now
+            return
+        }
+        // 새 앱: 바라는 높이에서 가장 가까운 빈자리 (위아래로 번갈아 찾는다)
+        for a in apps where appY[a] == nil {
+            let w = max(top, appWant(a, now: now) ?? (appY.values.max().map { $0 + appGap } ?? top))
+            var y = w
+            for i in 0..<400 {
+                let d = CGFloat((i + 1) / 2) * 4 * (i % 2 == 0 ? 1 : -1)
+                let cand = w + d
+                if cand >= top, !appY.values.contains(where: { abs($0 - cand) < appGap - 0.5 }) { y = cand; break }
+            }
+            appY[a] = y
+            moving = true
+        }
     }
     // 핑: 데이터가 오가면 경로를 따라 빛줄기 하나가 흐르고, 도착점에서 원이 한 번 퍼진다 (경로마다 pulseGap 에 한 번까지)
     struct Pulse { var key: String; var t0: Date; var dir: Int }
@@ -497,34 +664,26 @@ final class RouteScene {
             icons[app] = img
         }
         if !apps.contains(app) {
-            if apps.count >= 7, let oldest = apps.min(by: { (appSeen[$0] ?? .distantPast) < (appSeen[$1] ?? .distantPast) }) {
-                apps.removeAll { $0 == oldest }
-                if !reduceMotion, let at = shown["a:" + oldest] { leaving[oldest] = (Date(), at) }
-                shown["a:" + oldest] = nil
-            }
+            // 앱 칸은 밀어내지 않는다: 오래 조용한 앱만 pruneApps 가 뺀다 (예전에는 8번째 앱이 오면 가장 오래된 앱이 빠져 칸이 자꾸 바뀌었다)
             apps.append(app)
             if !reduceMotion { appeared["a:" + app] = Date(); moving = true }
         }
+        appExits[app, default: [:]][e.act == "block" ? "block" : e.iface] = Date()
         let slot = slot(for: e)
+        let row = row(for: e)
         if e.outside == true {
             groupSeen[slot] = Date()
             groupLatest[slot] = nameFor(e.dst) ?? e.dst
             var ips = groupIPs[slot] ?? []
             if !ips.contains(e.dst) { ips.append(e.dst); if ips.count > 20 { ips.removeFirst() } }
             groupIPs[slot] = ips
-            if !outsideGroups.contains(slot) {
-                if outsideGroups.count >= Self.maxGroups,
-                   let oldest = outsideGroups.min(by: { (groupSeen[$0] ?? .distantPast) < (groupSeen[$1] ?? .distantPast) }) {
-                    outsideGroups.removeAll { $0 == oldest }
-                    groupExits[oldest] = nil
-                }
-                outsideGroups.append(slot)
-            }
+            // 목적지 줄도 밀어내지 않는다: 자리가 차면 "그 밖의 목적지" 한 줄로 모으고, 조용한 줄은 pruneGroups 가 뺀다
+            if !outsideGroups.contains(slot), outsideGroups.count < Self.maxGroups { outsideGroups.append(slot) }
         }
         // 수립된 연결 = 길을 만든다 (캡슐은 패킷이 오갈 때)
         if e.act == "pass" {
             if flows[e.flowKey]?.closedAt != nil { return }      // 이미 닫힌 연결에 늦게 온 열림
-            let f = Flow(key: e.flowKey, app: app, slot: slot, iface: e.iface, ev: e, opened: Date(), closedAt: nil)
+            let f = Flow(key: e.flowKey, app: app, slot: slot, row: row, iface: e.iface, ev: e, opened: Date(), closedAt: nil)
             if !flows.values.contains(where: { $0.bundle == f.bundle && $0.closedAt == nil }) { bundleOpened[f.bundle] = Date() }
             flows[e.flowKey] = f
             var c = Cap(ev: e, app: app, t0: Date()); c.slot = slot
@@ -535,8 +694,8 @@ final class RouteScene {
         guard !paused else { return }
         if let z = zoom, !z.matches(e, app: app, slot: slot) { return }
         if reduceMotion || !capsules {
-            var c = Cap(ev: e, app: app, t0: Date()); c.slot = slot; land(c)
-            if e.act == "block" { addPulse("blk:" + slot, dir: 1) }
+            var c = Cap(ev: e, app: app, t0: Date()); c.slot = slot; c.row = row; land(c)
+            if e.act == "block" { addPulse("blk:\(app)|\(row)", dir: 1) }
             return
         }
         // 1초 안의 같은 흐름은 묶는다
@@ -555,7 +714,7 @@ final class RouteScene {
         var f = flows[e.flowKey]
         if f == nil {
             // 열림을 못 본 연결(창을 연 직후 등): 길만 만들어 둔다
-            let nf = Flow(key: e.flowKey, app: Self.appLabel(e), slot: slot(for: e), iface: e.iface, ev: e, opened: Date(), closedAt: nil)
+            let nf = Flow(key: e.flowKey, app: Self.appLabel(e), slot: slot(for: e), row: row(for: e), iface: e.iface, ev: e, opened: Date(), closedAt: nil)
             flows[e.flowKey] = nf
             bundleOpened[nf.bundle] = Date()
             f = nf
@@ -595,6 +754,7 @@ final class RouteScene {
     /// 캡슐이 끝에 닿았을 때: 전선을 데우고, 숫자를 세고, 막혔으면 파편을 튀긴다.
     func land(_ c: Cap, at: CGPoint? = nil) {
         let rule = c.slot.isEmpty ? (c.ev.rule ?? "?") : c.slot
+        let now0 = Date()
         if c.ev.outside == true {
             let k = "o:\(rule)|\(c.ev.iface)"
             heat[k] = min(1.5, (heat[k] ?? 0) + 0.5)
@@ -602,6 +762,13 @@ final class RouteScene {
         }
         heat["r:\(rule)"] = min(1.5, (heat["r:\(rule)"] ?? 0) + 0.5)
         heat["a:\(c.app)|\(rule)"] = min(1.5, (heat["a:\(c.app)|\(rule)"] ?? 0) + 0.6)
+        if c.ev.act == "block" {
+            let row = c.row.isEmpty ? row(for: c.ev) : c.row
+            heat["ab:\(c.app)"] = min(1.5, (heat["ab:\(c.app)"] ?? 0) + 0.6)       // 앱 → 막음
+            heat["wb:\(row)"] = min(1.5, (heat["wb:\(row)"] ?? 0) + 0.6)            // 막음 → 목적지 줄
+            hits.append((now0, "w:\(row)"))
+            blockPairs["\(c.app)|\(row)"] = now0
+        }
         let now = Date()
         hits.append((now, "r:\(rule)"))
         hits.append((now, c.ev.act == "block" ? "x:block" : "x:\(c.ev.iface)"))
@@ -655,6 +822,7 @@ final class RouteScene {
         }
         for (k, v) in flash { let n = v - dt * 2.5; flash[k] = n > 0 ? n : nil }
         hits.removeAll { now.timeIntervalSince($0.0) > 60 }
+        if !blockPairs.isEmpty { blockPairs = blockPairs.filter { now.timeIntervalSince($0.value) < 60 } }
         morphs = morphs.filter { now.timeIntervalSince($0.value.t0) < Self.morphDuration }
         notes = notes.filter { now.timeIntervalSince($0.value.t0) < Self.noteDuration }
         if idle { DispatchQueue.main.async { [weak self] in self?.onIdle?() } }
@@ -693,15 +861,38 @@ struct MiniMeter: View {
     }
 }
 
-/// 흐름도에서 강조할 경로: 앱·규칙·출구 중 정한 것만 맞춰 본다 (nil = 아무거나)
+/// 흐름도에서 강조할 경로: 앱·목적지 줄·규칙 묶음·출구 중 정한 것만 맞춰 본다 (nil = 아무거나)
 struct PathFocus: Equatable {
     var app: String? = nil
-    var rule: String? = nil
-    var iface: String? = nil
-    /// 선(또는 칸)이 이 경로에 속하는지. 선 쪽의 nil 은 그 칸을 거치지 않는 선이라 따지지 않는다
-    func matches(app a: String?, rule r: String?, iface x: String?) -> Bool {
-        (app == nil || a == nil || app == a) && (rule == nil || r == nil || rule == r) && (iface == nil || x == nil || iface == x)
+    var row: String? = nil
+    var group: String? = nil          // 규칙 id, 또는 규칙 밖 "~"
+    var iface: String? = nil          // 출구 인터페이스, 또는 "block"
+    func matches(app a: String, row r: String, iface x: String) -> Bool {
+        (app == nil || app == a) && (row == nil || row == r) && (group == nil || group == RouteScene.group(ofRow: r)) && (iface == nil || iface == x)
     }
+}
+
+/// 강조한 경로가 지나는 칸과 선
+struct FocusSets {
+    var nodes = Set<String>()         // "a:앱", "x:출구", "w:줄", "g:묶음"
+    var appExit = Set<String>()       // "앱|출구"
+    var exitRow = Set<String>()       // "줄|출구"
+}
+
+/// 오른쪽 기둥의 목적지 줄 하나
+struct DiagramRow {
+    let key: String                   // RouteScene.row(for:) 와 같은 열쇠
+    let slot: String                  // 규칙 id, 또는 규칙 밖 "~목적지"
+    let title: String
+    let sub: String
+    let ips: [String]                 // 나라 표시·규칙 만들기에 쓰는 주소
+    var more = false                  // "그 밖의 …" 줄
+}
+/// 규칙 하나(또는 규칙 밖)의 묶음
+struct DiagramGroup {
+    let key: String                   // 규칙 id, 또는 "~"
+    let rule: RuleStatus?
+    let rows: [DiagramRow]
 }
 
 /// 연결 목록을 묶는 방식
@@ -725,37 +916,29 @@ enum Zoom: Equatable {
 // MARK: - 배치
 
 
+/// 흐름도 배치 (위에서부터 쌓는다: 칸이 늘거나 줄어도 위쪽 칸은 움직이지 않는다)
+/// 왼쪽 앱, 가운데 출구(막음 포함), 오른쪽 규칙 묶음 안의 목적지 줄. 앱·출구 높이는 RouteScene 의 붙박이 자리에서 온다.
 struct RouteLayout {
     var app: [String: CGPoint] = [:]
-    var rule: [String: CGPoint] = [:]
-    var exit: [String: CGPoint] = [:]       // 인터페이스 → 자리
-    var wall = CGPoint.zero
-    var ruleSize = CGSize(width: 200, height: 34)
-    var nodeSize = CGSize(width: 150, height: 40)
-    var appSize = CGSize(width: 130, height: 30)
+    var exit: [String: CGPoint] = [:]       // 인터페이스 → 가운데
+    var wall = CGPoint.zero                 // 막음
+    var row: [String: CGPoint] = [:]        // 목적지 줄 → 가운데
+    var group: [String: CGRect] = [:]       // 묶음 → 점선 테두리
+    var appSize = CGSize(width: 150, height: 30)
+    var nodeSize = CGSize(width: 180, height: 44)
+    var rowSize = CGSize(width: 320, height: 36)
+    var height: CGFloat = 0                 // 필요한 그림 높이
+    static let top: CGFloat = 70
+    static let padTop: CGFloat = 16, padX: CGFloat = 10, padBottom: CGFloat = 10, rowGap: CGFloat = 8, groupGap: CGFloat = 22
+    static let appGap: CGFloat = 44, exitGap: CGFloat = 62
 
-    init(size: CGSize, apps: [String], rules: [RuleStatus], exits: [ExitInfo], outside: [String]) {
-        let top: CGFloat = 34, bottom = size.height - 14
-        // 칸 사이를 72pt 까지만 벌리고 가운데로 모은다 (칸이 적을 때 창 끝까지 흩어지지 않게)
-        func ys(_ n: Int) -> [CGFloat] {
-            let k = CGFloat(max(n, 1)), step = min(72, (bottom - top) / k)
-            let start = top + ((bottom - top) - step * k) / 2
-            return (0..<max(n, 1)).map { start + step * (CGFloat($0) + 0.5) }
-        }
-        let ax = max(76, size.width * 0.1), rx = size.width * 0.47, ex = size.width - max(96, size.width * 0.12)
-        for (a, y) in zip(apps, ys(apps.count)) { app[a] = CGPoint(x: ax, y: y) }
-        let slots = rules.count + outside.count
-        let rh = min(36, (bottom - top) / CGFloat(max(slots, 1)) - 4)
-        ruleSize = CGSize(width: min(264, size.width * 0.29), height: max(20, rh))
-        let rys = ys(slots)
-        for (r, y) in zip(rules, rys) { rule[r.id] = CGPoint(x: rx, y: y) }
-        for (k, y) in zip(outside, rys.dropFirst(rules.count)) { rule[k] = CGPoint(x: rx, y: y) }
-        let col = ys(exits.count + 1)
-        for (e, y) in zip(exits, col) { exit[e.iface] = CGPoint(x: ex, y: y) }
-        wall = CGPoint(x: ex, y: col.last ?? bottom)
-        nodeSize = CGSize(width: min(200, max(176, size.width * 0.21)), height: 44)
-        appSize = CGSize(width: min(150, max(120, size.width * 0.16)), height: 30)
-    }
+    func appRight(_ a: String) -> CGPoint? { app[a].map { CGPoint(x: $0.x + appSize.width / 2, y: $0.y) } }
+    func exitLeft(_ x: String) -> CGPoint? { (x == "block" ? wall : exit[x]).map { CGPoint(x: $0.x - nodeSize.width / 2, y: $0.y) } }
+    func exitRight(_ x: String) -> CGPoint? { (x == "block" ? wall : exit[x]).map { CGPoint(x: $0.x + nodeSize.width / 2, y: $0.y) } }
+    func rowLeft(_ r: String) -> CGPoint? { row[r].map { CGPoint(x: $0.x - rowSize.width / 2, y: $0.y) } }
+    func rowRect(_ r: String) -> CGRect? { row[r].map { CGRect(x: $0.x - rowSize.width / 2, y: $0.y - rowSize.height / 2, width: rowSize.width, height: rowSize.height) } }
+    func nodeRect(_ c: CGPoint) -> CGRect { CGRect(x: c.x - nodeSize.width / 2, y: c.y - nodeSize.height / 2, width: nodeSize.width, height: nodeSize.height) }
+    func appRect(_ c: CGPoint) -> CGRect { CGRect(x: c.x - appSize.width / 2, y: c.y - appSize.height / 2, width: appSize.width, height: appSize.height) }
 }
 
 func cubic(_ a: CGPoint, _ b: CGPoint, _ t: CGFloat) -> CGPoint {
@@ -791,6 +974,10 @@ struct RoutesWindow: View {
     @State private var focusExit: String?
     @State private var zoom: Zoom?                // 하나만 보기 (더블클릭 또는 머리의 "보기" 메뉴)
     @State private var lastTargets: [String: String] = [:]
+    @State private var quick: QuickPop?             // 앱·목적지를 눌러 연 빠른 규칙 팝오버
+    @AppStorage("routesZoom") private var userZoom = 1.0   // − + 단추·핀치로 고른 배율 (창 너비에 맞춘 배율에 곱한다)
+    @State private var pinchBase: Double?
+    private static let zoomRange = 0.5 ... 2.0
 
     @Environment(\.colorScheme) private var scheme
     @AppStorage("routesAlwaysDark") private var alwaysDark = false
@@ -867,8 +1054,8 @@ struct RoutesWindow: View {
         stream.animating = true
     }
     private var exits: [ExitInfo] { m.status?.exits ?? [] }
-    /// 규칙 칸과 규칙 밖 칸이 많으면 그림을 세로로 늘리고 스크롤한다 (칸 하나에 30pt)
-    private var stageNeeded: CGFloat { CGFloat(56 + (rules.count + visibleGroups.count) * 30) }
+    /// 빠른 규칙 팝오버가 열린 앱 (그 칸에 링을 두른다)
+    private var quickApp: String? { if case .app(let a)? = quick?.kind { return a }; return nil }
 
     /// 규칙마다 지금 전선이 가는 곳: 출구 인터페이스 / "block" / "none"
     private func targetKey(_ r: RuleStatus) -> String {
@@ -931,6 +1118,7 @@ struct RoutesWindow: View {
             stream.scene.onMoving = { [weak st2] m in st2?.nodesSettled(m) }
             let st = stream
             stream.scene.onIdle = { [weak st] in st?.sceneWentIdle() }
+            stream.setRules(m.status?.rules ?? [])
             stream.start()
         }
         .onDisappear { stream.stop() }      // 창을 닫으면 엔진이 pf 기록을 끈다
@@ -940,6 +1128,8 @@ struct RoutesWindow: View {
         .onAppear { lastTargets = targetSignature }
         .onChange(of: selection) { _, sel in applySelection(sel) }
         .onChange(of: groupBy) { selection = nil }
+        .onChange(of: quick?.id) { stream.scene.interacting = quick != nil || hoverPath != nil; stream.nodesSettled(true) }
+        .onChange(of: m.status?.rules) { stream.setRules(m.status?.rules ?? []) }
         .navigationTitle("라우팅 보기")
         .navigationSubtitle(statusLine)
         .toolbar { toolbarContent }
@@ -953,9 +1143,10 @@ struct RoutesWindow: View {
 
     private var diagram: some View {
         GeometryReader { geo in
-            let scale = min(1, max(Self.minScale, geo.size.width / Self.minDiagramWidth))
+            let fit = min(1, max(Self.minScale, geo.size.width / Self.minDiagramWidth))
+            let scale = fit * CGFloat(userZoom)
             let innerW = max(geo.size.width / scale, Self.minDiagramWidth)
-            let innerH = max(geo.size.height / scale, stageNeeded)
+            let innerH = max(geo.size.height / scale, layout(CGSize(width: innerW, height: 0)).height)
             let size = CGSize(width: innerW, height: innerH)
             ScrollView([.vertical, .horizontal]) {
                 ZStack {
@@ -980,21 +1171,41 @@ struct RoutesWindow: View {
                         let (focus, tip) = hoverTarget(p, size: size)
                         if focus != hoverPath { hoverPath = focus; stream.scene.nodeFading = true; stream.nodesSettled(true) }
                         hoverTip = tip.map { ($0, p) }
+                        stream.scene.interacting = true
                     case .ended:
                         hoverNode = nil; hoverTip = nil
                         if hoverPath != nil { hoverPath = nil; stream.scene.nodeFading = true; stream.nodesSettled(true) }
+                        stream.scene.interacting = quick != nil
                     }
                 }
                 .onTapGesture(count: 2, coordinateSpace: .local) { p in doubleTap(p, size: size) }
                 .onTapGesture(coordinateSpace: .local) { p in tap(p, size: size) }
                 .overlay(alignment: .topLeading) { hoverTipView(width: innerW, scale: scale) }
-                .overlay(alignment: .bottomLeading) { legend.padding(14) }
                 .frame(width: innerW, height: innerH)
                 .scaleEffect(scale, anchor: .topLeading)
                 .frame(width: innerW * scale, height: innerH * scale, alignment: .topLeading)
+                .popover(item: $quick, attachmentAnchor: .rect(.rect(scaled(quick?.anchor ?? .zero, scale))),
+                         arrowEdge: quick?.edge ?? .trailing) { q in quickContent(q) }
             }
             .scrollDisabled(innerW * scale <= geo.size.width + 0.5 && innerH * scale <= geo.size.height + 0.5)
             .overlay(alignment: .top) { zoomChip.padding(.top, 10) }
+            // 범례와 배율 단추는 그림 위에 떠 있다 (스크롤해도 제자리, 줄여도 글자 크기 그대로)
+            .overlay(alignment: .bottom) {
+                HStack(alignment: .bottom) {
+                    legend
+                    Spacer(minLength: 12)
+                    zoomControls(scale: scale)
+                }
+                .padding(14)
+            }
+            .simultaneousGesture(
+                MagnifyGesture()
+                    .onChanged { v in
+                        if pinchBase == nil { pinchBase = userZoom }
+                        setZoomLevel((pinchBase ?? 1) * v.magnification)
+                    }
+                    .onEnded { _ in pinchBase = nil }
+            )
             .overlay { emptyState }
         }
         .background(stage)
@@ -1087,6 +1298,91 @@ struct RoutesWindow: View {
         openWindow(id: "rules")
     }
 
+    // MARK: 빠른 규칙 (앱·목적지를 누르면)
+
+    private func scaled(_ r: CGRect, _ k: CGFloat) -> CGRect { CGRect(x: r.minX * k, y: r.minY * k, width: r.width * k, height: r.height * k) }
+
+    /// 규칙 밖 목적지 줄 → 규칙 초안: 그 목적지로 간 IPv4 들, 이름은 목적지
+    private func quickSeed(_ row: DiagramRow) -> QuickRuleSeed {
+        let ips = (stream.scene.groupIPs[row.key] ?? row.ips).filter { Target.isIPv4($0) }
+        let ds = stream.dests.values.filter { $0.row == row.key && !$0.blocked }
+        let live = ds.reduce(0) { $0 + $1.live.count }
+        let iface = ds.first { !$0.live.isEmpty }?.iface ?? ds.first?.iface
+        let apps = Array(Set(ds.map(\.app))).sorted()
+        var ctx = iface.map { "지금 \(exitName($0))로 나가요" } ?? "평소 경로로 나가요"
+        if !apps.isEmpty { ctx += " · " + apps.prefix(2).joined(separator: ", ") + (live > 0 ? " 연결 \(live)개" : "") }
+        let items = ips.map { QuickItem(id: $0, sub: names.name($0) ?? "", cc: GeoIP.shared.country($0)) }
+        return QuickRuleSeed(title: row.title, context: ctx, items: items, name: row.title, reverseNamed: !Target.isIPv4(row.title))
+    }
+
+    /// 앱이 최근 10분에 간 곳: 목적지 줄마다 하나 (넘친 목적지는 IP 마다). 규칙이 맡은 곳은 그 규칙 이름을 붙여 고를 수 없게
+    private func quickAppRows(_ app: String) -> [QuickAppRow] {
+        var rows: [String: (title: String, ips: Set<String>, iface: String, live: Int, ruled: String?)] = [:]
+        for d in stream.dests.values where d.app == app && !d.blocked {
+            let key = d.row == "~+" || d.row.isEmpty ? "ip:" + d.dst : d.row
+            let ruled: String? = d.outside ? nil : (m.status?.rules.first { $0.id == d.slot }?.title ?? d.slot)
+            let title = key.hasPrefix("ip:") ? d.dst : rowTitle(d.row)
+            var r = rows[key] ?? (title, [], d.iface, 0, ruled)
+            r.ips.insert(d.dst); r.live += d.live.count
+            if !d.live.isEmpty { r.iface = d.iface }
+            rows[key] = r
+        }
+        return rows.map { k, r in
+            let ips = r.ips.sorted()
+            let sub = (ips.count == 1 ? ips[0] : "IP \(ips.count)개") + " · " + exitName(r.iface)
+            return QuickAppRow(id: k, title: r.title, sub: sub, cc: ips.first.flatMap { GeoIP.shared.country($0) }, ips: ips, ruled: r.ruled)
+        }
+        .sorted { a, b in
+            if (a.ruled == nil) != (b.ruled == nil) { return a.ruled == nil }
+            let la = rows[a.id]?.live ?? 0, lb = rows[b.id]?.live ?? 0
+            return la != lb ? la > lb : a.title < b.title
+        }
+    }
+
+    /// 앱 묶음(.app) 경로 (앱별 스플리팅에 넣을 수 있는지)
+    private func appBundle(_ app: String) -> URL? {
+        stream.dests.values.first { $0.app == app && ($0.exe ?? "").hasSuffix(".app") }.flatMap { $0.exe }.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// 빠른 규칙을 엔진에 넣는다 (규칙 창과 같은 add 명령). 실패하면 까닭을 돌려준다
+    private func saveQuick(_ rule: Rule) async -> String? {
+        await m.saveRule(rule, isNew: true, draftKey: "quick")
+        if let msg = m.message { return msg }
+        quick = nil
+        return nil
+    }
+
+    @ViewBuilder private func quickContent(_ q: QuickPop) -> some View {
+        switch q.kind {
+        case .rule(let seed):
+            QuickRuleForm(seed: seed, candidates: exitCandidates(), save: { await saveQuick($0) },
+                          more: { d in
+                              quick = nil
+                              m.drafts["new"] = d; m.windowSelection = "new"
+                              NSApp.activate(); openWindow(id: "rules")
+                          },
+                          cancel: { quick = nil })
+        case .app(let a):
+            let live = stream.liveCount { $0.app == a && !$0.blocked }
+            let ifaces = Set(stream.dests.values.filter { $0.app == a && !$0.live.isEmpty }.map(\.iface)).sorted()
+            QuickAppMenu(app: a, icon: stream.scene.icons[a],
+                         context: "연결 \(live)개" + (ifaces.isEmpty ? "" : " · " + ifaces.map(exitName).joined(separator: ", ")),
+                         rows: quickAppRows(a), canSplit: appBundle(a) != nil,
+                         makeRule: { rows in
+                             let items = rows.flatMap { r in r.ips.filter { Target.isIPv4($0) }.map { QuickItem(id: $0, sub: r.title, cc: GeoIP.shared.country($0)) } }
+                             let title = rows.count == 1 ? rows[0].title : "\(a)이(가) 간 \(rows.count)곳"
+                             quick?.kind = .rule(QuickRuleSeed(title: title, context: "\(a)의 연결에서", items: items,
+                                                               name: rows.count == 1 ? rows[0].title : a, reverseNamed: rows.contains { !Target.isIPv4($0.title) }))
+                         },
+                         split: {
+                             quick = nil
+                             AppModel.shared.pendingSplitApp = appBundle(a)
+                             AppWindows.open("app-rules")
+                         },
+                         zoom: { quick = nil; setZoom(.app(a)) })
+        }
+    }
+
     // MARK: 머리
 
     @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
@@ -1122,25 +1418,27 @@ struct RoutesWindow: View {
     }
 
     // MARK: 그리기
+    // 왼쪽 앱 → 가운데 출구(막음 포함) → 오른쪽 규칙 묶음 안의 목적지 줄. 선 색은 나간 출구, 굵기는 최근 6초 오간 양.
 
     /// 그릴 때 쓰는 배치: 칸이 목표 자리로 0.3초쯤에 걸쳐 부드럽게 옮겨 간다 (한 프레임에 한 번만 나아간다)
     private func animatedLayout(_ size: CGSize, now: Date) -> RouteLayout {
         var L = layout(size)
         let sc = stream.scene
         if sc.reduceMotion { return L }
-        if sc.layoutSize != size {
-            // 창 크기를 바꾸는 중에는 따라가지 않고 바로 맞춘다 (매 프레임 칸 전체를 다시 그려 버벅였다)
+        if sc.layoutSize.width != size.width {
+            // 창 너비를 바꾸는 중에는 따라가지 않고 바로 맞춘다 (매 프레임 칸 전체를 다시 그려 버벅였다)
             sc.layoutSize = size
             for (a, p) in L.app { sc.shown["a:" + a] = p }
-            for (r, p) in L.rule { sc.shown["r:" + r] = p }
             for (x, p) in L.exit { sc.shown["x:" + x] = p }
+            for (r, p) in L.row { sc.shown["w:" + r] = p }
+            for (g, r) in L.group { sc.shown["g:" + g] = r.origin }
             sc.shown["x:block"] = L.wall
             sc.layoutT = now
             return L
         }
         let dt = min(0.1, max(0, now.timeIntervalSince(sc.layoutT)))
         if now > sc.layoutT { sc.layoutT = now }
-        let k = 1 - exp(-dt * 13)
+        let k = 1 - exp(-dt * 11)
         var unsettled = false
         func ease(_ key: String, _ target: CGPoint) -> CGPoint {
             guard let cur = sc.shown[key] else { sc.shown[key] = target; return target }
@@ -1150,9 +1448,10 @@ struct RoutesWindow: View {
             return next
         }
         for (a, p) in L.app { L.app[a] = ease("a:" + a, p) }
-        for (r, p) in L.rule { L.rule[r] = ease("r:" + r, p) }
         for (x, p) in L.exit { L.exit[x] = ease("x:" + x, p) }
         L.wall = ease("x:block", L.wall)
+        for (r, p) in L.row { L.row[r] = ease("w:" + r, p) }
+        for (g, r) in L.group { L.group[g] = CGRect(origin: ease("g:" + g, r.origin), size: r.size) }
         sc.moving = unsettled || !sc.appeared.isEmpty || !sc.leaving.isEmpty || sc.nodeFading
         return L
     }
@@ -1179,79 +1478,170 @@ struct RoutesWindow: View {
     private func easeOut(_ t: Double) -> Double { let u = 1 - min(1, max(0, t)); return 1 - u * u * u }
     private func easeInOut(_ t: Double) -> Double { let x = min(1, max(0, t)); return x < 0.5 ? 4 * x * x * x : 1 - pow(-2 * x + 2, 3) / 2 }
 
-    /// 핑: 경로를 따라 흐르는 빛줄기, 끝에 닿으면 연결점에서 원이 한 번 퍼진다
-    /// rings: false = 빛줄기만 (칸 아래 층에 그려 칸 글자를 가로지르지 않게), true = 도착점의 원만 (칸 위 층)
-    private func drawPulses(_ ctx: inout GraphicsContext, _ L: RouteLayout, now: Date, rings: Bool) {
-        for p in stream.scene.pulses {
-            let t = now.timeIntervalSince(p.t0) / RouteScene.pulseDuration
-            guard t >= 0, t <= 1 else { continue }
-            var path: Path?, color = fg, width: CGFloat = 2, end = CGPoint.zero
-            var focus = (app: String?.none, rule: String?.none, iface: String?.none)
-            if p.key.hasPrefix("b:") {
-                let parts = p.key.dropFirst(2).split(separator: "|", maxSplits: 2).map(String.init)
-                guard parts.count == 3, let pts = bundlePoints(app: parts[0], slot: parts[1], iface: parts[2], L) else { continue }
-                path = bundlePath(pts); end = p.dir > 0 ? pts.3 : pts.0
-                color = exitColor(exits.first { $0.iface == parts[2] })
-                width = 1.4 + CGFloat(stream.scene.smoothV["b:" + p.key.dropFirst(2)] ?? 0) * 4
-                focus = (parts[0], parts[1], parts[2])
-            } else if p.key.hasPrefix("blk:"), let rp = L.rule[String(p.key.dropFirst(4))] {
-                end = CGPoint(x: L.wall.x - L.nodeSize.width / 2, y: L.wall.y)
-                path = wirePath(CGPoint(x: rp.x + L.ruleSize.width / 2, y: rp.y), end); color = blockC; width = 1.6
-                focus = (nil, String(p.key.dropFirst(4)), "block")
+    /// 오른쪽 기둥: 규칙마다 묶음 (대상 줄 + 넘친 대상), 맨 아래 규칙 밖 묶음 (목적지 줄 + 넘친 목적지)
+    private var diagramGroups: [DiagramGroup] {
+        let scene = stream.scene
+        var used = Set(scene.flows.values.map(\.row))
+        for k in scene.heat.keys where k.hasPrefix("wb:") { used.insert(String(k.dropFirst(3))) }
+        var out: [DiagramGroup] = []
+        for r in rules {
+            var rows: [DiagramRow] = r.targets.prefix(RouteScene.targetCap).map { t in
+                DiagramRow(key: "t:\(r.id)|\(t.target)", slot: r.id, title: t.target, sub: targetSub(t), ips: t.addresses.map(\.ip))
             }
-            let away = fade("ld:p:" + p.key, lineDim(app: focus.app, rule: focus.rule, iface: focus.iface))
-            guard let path, away < 0.98 else { continue }
-            let e = easeInOut(min(1, t / 0.8))                     // 0.8 동안 흐르고, 남은 0.2 동안 도착점에서 퍼진다
-            let pos = p.dir > 0 ? e : 1 - e
-            let fade = sin(.pi * min(1, t / 0.8))
-            if !rings {
-            let seg = path.trimmedPath(from: max(0, pos - 0.07), to: min(1, pos + 0.01))
-            var g = ctx
-            g.opacity = fade * (1 - away)
-            g.stroke(seg, with: .color(color.opacity(0.35)), style: StrokeStyle(lineWidth: width + 6, lineCap: .round))
-            g.stroke(seg, with: .color(color), style: StrokeStyle(lineWidth: width + 1.5, lineCap: .round))
-            g.stroke(seg, with: .color(.white.opacity(dark ? 0.55 : 0.8)), style: StrokeStyle(lineWidth: max(1, width * 0.45), lineCap: .round))
+            let extra = r.targets.count - RouteScene.targetCap
+            let plus = "t:\(r.id)|+"
+            if extra > 0 || used.contains(plus) {
+                let names = r.targets.dropFirst(RouteScene.targetCap).prefix(3).map(\.target).joined(separator: ", ")
+                rows.append(DiagramRow(key: plus, slot: r.id, title: extra > 0 ? "그 밖의 대상 \(extra)개" : "그 밖의 주소",
+                                       sub: extra > 0 ? names : "대상 목록에 없던 주소", ips: [], more: true))
             }
-            if rings, t > 0.72 {
-                let k = easeOut((t - 0.72) / 0.28)
-                let r = 4 + 9 * k
-                ctx.stroke(Path(ellipseIn: CGRect(x: end.x - r, y: end.y - r, width: 2 * r, height: 2 * r)),
-                           with: .color(color.opacity(0.55 * (1 - k))), lineWidth: 1.5)
-            }
+            out.append(DiagramGroup(key: r.id, rule: r, rows: rows))
         }
+        var outside: [DiagramRow] = visibleGroups.map { g in
+            DiagramRow(key: g, slot: g, title: String(g.dropFirst()), sub: groupSub(g), ips: scene.groupIPs[g] ?? [])
+        }
+        var zoomedToRule = false
+        if case .rule? = zoom { zoomedToRule = true }
+        if used.contains("~+") && !zoomedToRule {
+            outside.append(DiagramRow(key: "~+", slot: "~+", title: "그 밖의 목적지", sub: "자리가 차서 한데 모았어요", ips: [], more: true))
+        }
+        if !outside.isEmpty { out.append(DiagramGroup(key: "~", rule: nil, rows: outside)) }
+        return out
+    }
+
+    private func targetSub(_ t: TargetStatus) -> String {
+        switch t.kind {
+        case .domain:
+            let ips = t.addresses.map(\.ip)
+            if ips.isEmpty { return "아직 못 풀었어요" }
+            return ips.count == 1 ? ips[0] : "\(ips[0]) 외 \(ips.count - 1)개"
+        case .cidr: return "대역"
+        case .ip: return t.addresses.first?.owner.map { "앞 규칙(\($0))이 맡음" } ?? "IP"
+        }
+    }
+
+    private func groupSub(_ g: String) -> String {
+        let name = String(g.dropFirst())
+        if let latest = stream.scene.groupLatest[g], latest != name { return latest }
+        if Target.isIPv4(name) { return "이름 없음" }
+        let ips = stream.scene.groupIPs[g] ?? []
+        return ips.count == 1 ? ips[0] : ips.isEmpty ? "규칙 없음" : "IP \(ips.count)개"
+    }
+
+    /// 줄의 나라 (서버가 있는 곳). 대역이면 첫 주소로 본다
+    private func rowCountry(_ row: DiagramRow) -> String? {
+        guard let ip = row.ips.first else { return nil }
+        return GeoIP.shared.country(String(ip.split(separator: "/")[0]))
     }
 
     private func layout(_ size: CGSize) -> RouteLayout {
-        RouteLayout(size: size, apps: visibleApps, rules: rules, exits: visibleExits, outside: visibleGroups)
-    }
-
-    /// 길의 네 점: 앱 오른쪽, 규칙 왼쪽·오른쪽, 출구 왼쪽
-    private func bundlePoints(app: String, slot: String, iface: String, _ L: RouteLayout) -> (CGPoint, CGPoint, CGPoint, CGPoint)? {
-        guard let a = L.app[app], let r = L.rule[slot], let e = L.exit[iface] else { return nil }
-        return (CGPoint(x: a.x + L.appSize.width / 2, y: a.y), CGPoint(x: r.x - L.ruleSize.width / 2, y: r.y),
-                CGPoint(x: r.x + L.ruleSize.width / 2, y: r.y), CGPoint(x: e.x - L.nodeSize.width / 2, y: e.y))
-    }
-
-    private func bundlePath(_ pts: (CGPoint, CGPoint, CGPoint, CGPoint)) -> Path {
-        var p = wirePath(pts.0, pts.1)
-        p.addLine(to: pts.2)
-        p.addPath(wirePath(pts.2, pts.3))
-        return p
-    }
-
-    /// 캡슐의 세 점: 앱, 규칙, 끝 (통과 = 출구, 막힘 = 나가려던 출구 앞 또는 차단 벽)
-    private func endpoints(_ c: RouteScene.Cap, _ L: RouteLayout) -> (CGPoint, CGPoint, CGPoint)? {
-        guard let a = L.app[c.app], let r = L.rule[c.slot] else { return nil }
-        let half = L.nodeSize.width / 2
-        if c.ev.act == "pass", let e = L.exit[c.ev.iface] { return (a, r, CGPoint(x: e.x - half, y: e.y)) }
-        if c.ev.act == "block", let al = c.ev.allow, al != c.ev.iface, let e = L.exit[c.ev.iface] {
-            return (a, r, CGPoint(x: e.x - half - 26, y: e.y))      // 나가려던 출구 바로 앞에서 부서진다
+        var L = RouteLayout()
+        let w = size.width
+        L.appSize = CGSize(width: min(160, max(124, w * 0.15)), height: 30)
+        L.nodeSize = CGSize(width: min(196, max(164, w * 0.18)), height: 44)
+        let ax = 22 + L.appSize.width / 2
+        let ex = max(ax + L.appSize.width / 2 + 80 + L.nodeSize.width / 2, w * 0.40)
+        let gx = ex + L.nodeSize.width / 2 + max(70, w * 0.08)
+        let gw = max(250, w - 22 - gx)
+        L.rowSize = CGSize(width: gw - 2 * RouteLayout.padX, height: 36)
+        var y = RouteLayout.top
+        let groups = diagramGroups
+        for g in groups {
+            let n = CGFloat(g.rows.count)
+            let h = RouteLayout.padTop + n * L.rowSize.height + max(0, n - 1) * RouteLayout.rowGap + RouteLayout.padBottom
+            L.group[g.key] = CGRect(x: gx, y: y, width: gw, height: h)
+            for (i, r) in g.rows.enumerated() {
+                let cy = y + RouteLayout.padTop + CGFloat(i) * (L.rowSize.height + RouteLayout.rowGap) + L.rowSize.height / 2
+                L.row[r.key] = CGPoint(x: gx + gw / 2, y: cy)
+            }
+            y += h + RouteLayout.groupGap
         }
-        return (a, r, CGPoint(x: L.wall.x - half, y: L.wall.y))
+        // 출구가 바라는 높이: 그 출구로 보내는 규칙 묶음의 가운데 + 지금 그 출구로 열린 연결이 닿는 줄들의 평균
+        var wants: [String: [CGFloat]] = [:]
+        for r in rules {
+            guard let gr = L.group[r.id] else { continue }
+            if r.decision == "route", let i = r.chosenIface { wants[i, default: []].append(gr.midY) }
+            if r.decision == "block" { wants["block", default: []].append(gr.midY) }
+        }
+        for f in stream.scene.flows.values where f.closedAt == nil {
+            if let ry = L.row[f.row]?.y { wants[f.iface, default: []].append(ry) }
+        }
+        for k in stream.scene.heat.keys where k.hasPrefix("wb:") {
+            if let ry = L.row[String(k.dropFirst(3))]?.y { wants["block", default: []].append(ry) }
+        }
+        let exitWant = wants.mapValues { $0.reduce(0, +) / CGFloat($0.count) }
+        let order = visibleExits.map(\.iface) + ["block"]
+        let top = RouteLayout.top + L.nodeSize.height / 2
+        let key = order.joined(separator: ",") + "/" + groups.map(\.key).joined(separator: ",")
+        stream.scene.arrange(apps: visibleApps, exits: order, exitWant: exitWant, key: key, zoomKey: zoom.map { "\($0)" } ?? "",
+                             top: top, appGap: RouteLayout.appGap, exitGap: RouteLayout.exitGap)
+        var bottom = y
+        for (i, x) in order.enumerated() {
+            let cy = stream.scene.exitY[x] ?? top + CGFloat(i) * RouteLayout.exitGap
+            if x == "block" { L.wall = CGPoint(x: ex, y: cy) } else { L.exit[x] = CGPoint(x: ex, y: cy) }
+            bottom = max(bottom, cy + L.nodeSize.height)
+        }
+        for a in visibleApps {
+            let cy = stream.scene.appY[a] ?? top
+            L.app[a] = CGPoint(x: ax, y: cy)
+            bottom = max(bottom, cy + L.appSize.height)
+        }
+        L.height = bottom + 48
+        return L
     }
 
-    /// 점이 올라간 앱 칸·출구 칸
-    // MARK: 마우스 올림: 경로 강조·설명
+    /// 길 하나: 앱 → 출구 → 목적지 줄 (출구 칸은 가로지른다). 줄이 안 보이면 출구까지만
+    private func routePath(app: String, row: String, iface: String, _ L: RouteLayout) -> (path: Path, start: CGPoint, end: CGPoint)? {
+        guard let a = L.appRight(app), let b = L.exitLeft(iface) else { return nil }
+        var p = wirePath(a, b)
+        guard let c = L.exitRight(iface), let d = L.rowLeft(row) else { return (p, a, b) }
+        p.addLine(to: c)
+        p.addPath(wirePath(c, d))
+        return (p, a, d)
+    }
+
+    /// 핑: 경로를 따라 흐르는 빛줄기, 끝에 닿으면 연결점에서 원이 한 번 퍼진다
+    private func drawPulses(_ ctx: inout GraphicsContext, _ L: RouteLayout, now: Date, rings: Bool, focus fs: FocusSets?) {
+        for p in stream.scene.pulses {
+            let t = now.timeIntervalSince(p.t0) / RouteScene.pulseDuration
+            guard t >= 0, t <= 1 else { continue }
+            // "b:앱|줄|출구" (데이터가 오감) · "blk:앱|줄" (막힘)
+            let block = p.key.hasPrefix("blk:")
+            let body = p.key.dropFirst(block ? 4 : 2)
+            guard let i = body.firstIndex(of: "|") else { continue }
+            let app = String(body[..<i])
+            var row = String(body[body.index(after: i)...]), iface = "block"
+            if !block {
+                guard let j = row.lastIndex(of: "|") else { continue }
+                iface = String(row[row.index(after: j)...]); row = String(row[..<j])
+            }
+            guard let r = routePath(app: app, row: row, iface: iface, L) else { continue }
+            let color = block ? blockC : exitColor(exits.first { $0.iface == iface })
+            let width: CGFloat = block ? 1.6 : 1.4 + CGFloat(stream.scene.smoothV["ax:\(app)|\(iface)"] ?? 0) * 4
+            let away = fade("ld:p:" + p.key, fs.map { !$0.appExit.contains(app + "|" + iface) } ?? false)
+            guard away < 0.98 else { continue }
+            let end = p.dir > 0 ? r.end : r.start
+            let e = easeInOut(min(1, t / 0.8))                     // 0.8 동안 흐르고, 남은 0.2 동안 도착점에서 퍼진다
+            let pos = p.dir > 0 ? e : 1 - e
+            let fadeIn = sin(.pi * min(1, t / 0.8))
+            if !rings {
+                let seg = r.path.trimmedPath(from: max(0, pos - 0.07), to: min(1, pos + 0.01))
+                var g = ctx
+                g.opacity = fadeIn * (1 - away)
+                g.stroke(seg, with: .color(color.opacity(0.35)), style: StrokeStyle(lineWidth: width + 6, lineCap: .round))
+                g.stroke(seg, with: .color(color), style: StrokeStyle(lineWidth: width + 1.5, lineCap: .round))
+                g.stroke(seg, with: .color(.white.opacity(dark ? 0.55 : 0.8)), style: StrokeStyle(lineWidth: max(1, width * 0.45), lineCap: .round))
+            }
+            if rings, t > 0.72 {
+                let k = easeOut((t - 0.72) / 0.28)
+                let rr = 4 + 9 * k
+                var g = ctx
+                g.opacity = 1 - away
+                g.stroke(Path(ellipseIn: CGRect(x: end.x - rr, y: end.y - rr, width: 2 * rr, height: 2 * rr)),
+                         with: .color(color.opacity(0.55 * (1 - k))), lineWidth: 1.5)
+            }
+        }
+    }
 
     /// 칸의 트래픽 막대 자리 (그리기와 같은 계산)
     private func meterRect(_ rect: CGRect, inset: CGFloat = NodeToken.inset) -> CGRect {
@@ -1269,65 +1659,114 @@ struct RoutesWindow: View {
         iface == "block" ? "막음" : exits.first { $0.iface == iface }.map { "\($0.label)(\(iface))" } ?? iface
     }
 
-    /// 점 p 에서 강조할 경로와 설명. 순서: 트래픽 막대 → 칸 → 선
-    private func hoverTarget(_ p: CGPoint, size: CGSize) -> (PathFocus?, String?) {
-        let L = layout(size)
-        func inside(_ c: CGPoint, _ s: CGSize) -> Bool { abs(p.x - c.x) <= s.width / 2 && abs(p.y - c.y) <= s.height / 2 }
-        func box(_ c: CGPoint, _ s: CGSize) -> CGRect { CGRect(x: c.x - s.width / 2, y: c.y - s.height / 2, width: s.width, height: s.height) }
-        for a in visibleApps {
-            guard let c = L.app[a], inside(c, L.appSize) else { continue }
-            if meterRect(box(c, L.appSize), inset: 10).insetBy(dx: -3, dy: -3).contains(p) { return (PathFocus(app: a), meterTip("a:\(a)", title: a)) }
-            return (PathFocus(app: a), nil)
-        }
-        for r in rules {
-            guard let c = L.rule[r.id], inside(c, L.ruleSize) else { continue }
-            if r.decision != "block", meterRect(box(c, L.ruleSize)).insetBy(dx: -3, dy: -3).contains(p) { return (PathFocus(rule: r.id), meterTip("r:\(r.id)", title: r.title)) }
-            return (PathFocus(rule: r.id), nil)
-        }
-        for e in visibleExits {
-            guard let c = L.exit[e.iface], inside(c, L.nodeSize) else { continue }
-            if meterRect(box(c, L.nodeSize)).insetBy(dx: -3, dy: -3).contains(p) { return (PathFocus(iface: e.iface), meterTip("x:\(e.iface)", title: exitName(e.iface))) }
-            return (PathFocus(iface: e.iface), nil)
-        }
-        if inside(L.wall, L.nodeSize) { return (PathFocus(iface: "block"), nil) }
-        // 선: 연결 길(앱 → 규칙 → 출구) 먼저, 그다음 규칙 → 출구
-        for (b, fs) in stream.scene.bundles {
-            guard let f0 = fs.first, let pts = bundlePoints(app: f0.app, slot: f0.slot, iface: f0.iface, L) else { continue }
-            if bundlePath(pts).strokedPath(StrokeStyle(lineWidth: 12, lineCap: .round)).contains(p) {
-                let live = fs.filter { $0.closedAt == nil }.count
-                let title = m.status?.rules.first { $0.id == f0.slot }?.title ?? String(f0.slot.dropFirst())
-                return (PathFocus(app: f0.app, rule: f0.slot, iface: f0.iface),
-                        "\(f0.app) → \(title) → \(exitName(f0.iface))\n연결 \(live) · 최근 6초 \(RouteScene.bytesText(stream.recent("b:\(b)")))")
-            }
-        }
-        for r in rules {
-            let key = targetKey(r)
-            guard key != "none", let rp = L.rule[r.id] else { continue }
-            let from = CGPoint(x: rp.x + L.ruleSize.width / 2, y: rp.y)
-            let end = key == "block" ? CGPoint(x: L.wall.x - L.nodeSize.width / 2, y: L.wall.y) : L.exit[key].map { CGPoint(x: $0.x - L.nodeSize.width / 2, y: $0.y) }
-            guard let end, wirePath(from, end).strokedPath(StrokeStyle(lineWidth: 12, lineCap: .round)).contains(p) else { continue }
-            let live = stream.liveCount { $0.slot == r.id && !$0.blocked }
-            return (PathFocus(rule: r.id, iface: key), "\(r.title) → \(exitName(key))\n" + (key == "block" ? "쓸 수 있는 출구가 없어 막는 중" : "연결 \(live) · 최근 6초 \(RouteScene.bytesText(stream.recent("re:\(r.id)|\(key)")))"))
-        }
-        return (nil, nil)
+    // MARK: 강조
+
+    /// 지금 강조할 경로: 마우스를 올린 것, 없으면 눌러 둔 규칙·출구
+    private var activeFocus: PathFocus? {
+        if let h = hoverPath { return h }
+        if let r = focusRule { return r.hasPrefix("~") ? PathFocus(row: r) : PathFocus(group: r) }
+        if let x = focusExit { return PathFocus(iface: x) }
+        return nil
     }
 
-    /// 강조한 경로가 지나는 칸들 ("a:앱", "r:규칙", "x:출구")
-    private func focusNodes(_ f: PathFocus) -> Set<String> {
-        var out = Set<String>()
-        if let a = f.app { out.insert("a:" + a) }
-        if let r = f.rule { out.insert("r:" + r) }
-        if let x = f.iface { out.insert("x:" + x) }
-        for (_, fs) in stream.scene.bundles {
-            guard let f0 = fs.first, f.matches(app: f0.app, rule: f0.slot, iface: f0.iface) else { continue }
-            out.formUnion(["a:" + f0.app, "r:" + f0.slot, "x:" + f0.iface])
+    /// 강조한 경로가 지나는 칸과 선
+    private func focusSets(_ f: PathFocus, groups: [DiagramGroup]) -> FocusSets {
+        var s = FocusSets()
+        let scene = stream.scene
+        func add(_ app: String, _ row: String, _ iface: String) {
+            s.nodes.formUnion(["a:" + app, "x:" + iface, "w:" + row, "g:" + RouteScene.group(ofRow: row)])
+            s.appExit.insert(app + "|" + iface)
+            s.exitRow.insert(row + "|" + iface)
         }
-        for r in rules where f.app == nil {
-            let key = targetKey(r)
-            guard key != "none", f.matches(app: nil, rule: r.id, iface: key) else { continue }
-            out.formUnion(["r:" + r.id, "x:" + key])
+        for fl in scene.flows.values where f.matches(app: fl.app, row: fl.row, iface: fl.iface) { add(fl.app, fl.row, fl.iface) }
+        let now = Date()
+        for (k, t) in scene.blockPairs where now.timeIntervalSince(t) < 60 {
+            guard let i = k.firstIndex(of: "|") else { continue }
+            let app = String(k[..<i]), row = String(k[k.index(after: i)...])
+            if f.matches(app: app, row: row, iface: "block") { add(app, row, "block") }
         }
-        return out
+        // 연결이 없어도: 그 출구로 보내는(또는 막는) 규칙 묶음
+        if f.app == nil && f.row == nil {
+            for r in rules {
+                let x: String? = r.decision == "route" ? r.chosenIface : r.decision == "block" ? "block" : nil
+                guard let x, f.iface == nil || f.iface == x, f.group == nil || f.group == r.id else { continue }
+                s.nodes.formUnion(["g:" + r.id, "x:" + x])
+                for row in groups.first(where: { $0.key == r.id })?.rows ?? [] {
+                    s.nodes.insert("w:" + row.key)
+                    if x == "block" { s.exitRow.insert(row.key + "|block") }
+                }
+            }
+        }
+        if let a = f.app { s.nodes.insert("a:" + a) }
+        if let r = f.row { s.nodes.formUnion(["w:" + r, "g:" + RouteScene.group(ofRow: r)]) }
+        if let g = f.group { s.nodes.insert("g:" + g) }
+        if let x = f.iface { s.nodes.insert("x:" + x) }
+        return s
+    }
+
+    private func rowTitle(_ key: String) -> String {
+        for g in diagramGroups { if let r = g.rows.first(where: { $0.key == key }) { return r.title } }
+        return key.hasPrefix("~") ? String(key.dropFirst()) : key
+    }
+
+    private func countryName(_ cc: String) -> String {
+        Locale(identifier: "ko").localizedString(forRegionCode: cc) ?? cc
+    }
+
+    private func hitLine(_ path: Path, _ p: CGPoint) -> Bool {
+        path.strokedPath(StrokeStyle(lineWidth: 12, lineCap: .round)).contains(p)
+    }
+
+    /// 점 p 에서 강조할 경로와 설명. 순서: 트래픽 막대 → 칸 → 묶음 제목 → 선
+    private func hoverTarget(_ p: CGPoint, size: CGSize) -> (PathFocus?, String?) {
+        let L = layout(size)
+        for a in visibleApps {
+            guard let c = L.app[a] else { continue }
+            let r = L.appRect(c)
+            guard r.contains(p) else { continue }
+            if meterRect(r, inset: 10).insetBy(dx: -3, dy: -3).contains(p) { return (PathFocus(app: a), meterTip("a:\(a)", title: a)) }
+            return (PathFocus(app: a), "\(a)\n누르면 간 곳으로 규칙 만들기")
+        }
+        for e in visibleExits {
+            guard let c = L.exit[e.iface] else { continue }
+            let r = L.nodeRect(c)
+            guard r.contains(p) else { continue }
+            if meterRect(r).insetBy(dx: -3, dy: -3).contains(p) { return (PathFocus(iface: e.iface), meterTip("x:\(e.iface)", title: exitName(e.iface))) }
+            return (PathFocus(iface: e.iface), nil)
+        }
+        if L.nodeRect(L.wall).contains(p) { return (PathFocus(iface: "block"), nil) }
+        for g in diagramGroups {
+            for row in g.rows {
+                guard let r = L.rowRect(row.key), r.contains(p) else { continue }
+                if !row.more, meterRect(r).insetBy(dx: -3, dy: -3).contains(p) {
+                    return (PathFocus(row: row.key), meterTip("w:\(row.key)", title: row.title))
+                }
+                var lines = [row.title]
+                if let cc = rowCountry(row) { lines.append("서버: \(countryName(cc))(\(cc))") }
+                if g.rule == nil && !row.more { lines.append("누르면 이 목적지로 규칙 만들기") }
+                return (PathFocus(row: row.key), row.more ? nil : lines.joined(separator: "\n"))
+            }
+            if let gr = L.group[g.key], CGRect(x: gr.minX, y: gr.minY - 10, width: gr.width, height: 20).contains(p) {
+                return (PathFocus(group: g.key), g.rule.map { "\($0.title)\n\($0.reason)" })
+            }
+        }
+        // 선: 앱 → 출구, 출구 → 목적지 줄
+        var seen = Set<String>()
+        for f in stream.scene.flows.values {
+            let ax = "ax:" + f.app + "|" + f.iface
+            if seen.insert(ax).inserted, let a = L.appRight(f.app), let b = L.exitLeft(f.iface), hitLine(wirePath(a, b), p) {
+                let live = stream.liveCount { $0.app == f.app && $0.iface == f.iface && !$0.blocked }
+                return (PathFocus(app: f.app, iface: f.iface),
+                        "\(f.app) → \(exitName(f.iface))\n연결 \(live) · 최근 6초 \(RouteScene.bytesText(stream.recent(ax)))")
+            }
+            let wx = "wx:" + f.row + "|" + f.iface
+            if seen.insert(wx).inserted, let a = L.exitRight(f.iface), let b = L.rowLeft(f.row), hitLine(wirePath(a, b), p) {
+                let live = stream.liveCount { $0.row == f.row && $0.iface == f.iface && !$0.blocked }
+                return (PathFocus(row: f.row, iface: f.iface),
+                        "\(exitName(f.iface)) → \(rowTitle(f.row))\n연결 \(live) · 최근 6초 \(RouteScene.bytesText(stream.recent(wx)))")
+            }
+        }
+        return (nil, nil)
     }
 
     @ViewBuilder private func hoverTipView(width: CGFloat, scale: CGFloat) -> some View {
@@ -1357,17 +1796,57 @@ struct RoutesWindow: View {
                 VStack(spacing: 1) { Capsule().fill(sentC).frame(width: 6, height: 3); Capsule().fill(recvC).frame(width: 6, height: 3) }
                 Text("최근 12초 보냄·받음")
             }
+            HStack(spacing: 4) {
+                Text("KR").font(.system(size: 8.5, weight: .semibold).monospaced())
+                    .padding(.horizontal, 3).overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(muted.opacity(0.5), lineWidth: 0.7))
+                Text("서버 나라 (IP Geolocation by DB-IP)")
+            }
         }
         .font(.system(size: 10)).foregroundStyle(muted)
-        .padding(.horizontal, 10).padding(.vertical, 5)
-        .background(Capsule().fill(stage.opacity(0.9)))
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .modifier(Floating(dark: dark, fill: cardC, light: lightShade, shade: darkShade))
         .allowsHitTesting(false)
+    }
+
+    private func setZoomLevel(_ z: Double) {
+        let v = min(Self.zoomRange.upperBound, max(Self.zoomRange.lowerBound, (z * 20).rounded() / 20))
+        if v != userZoom { userZoom = v }
+    }
+
+    /// 오른쪽 아래 배율: − 지금 배율 +. 가운데 숫자를 누르면 창에 맞춘 크기로 (⌘0)
+    private func zoomControls(scale: CGFloat) -> some View {
+        HStack(spacing: 0) {
+            Button { setZoomLevel(userZoom - 0.1) } label: {
+                Image(systemName: "minus").font(.system(size: 11, weight: .semibold)).frame(width: 30, height: 26).contentShape(Rectangle())
+            }
+            .keyboardShortcut("-", modifiers: .command)
+            .disabled(userZoom <= Self.zoomRange.lowerBound)
+            .help("줄이기 (⌘−)")
+            .accessibilityLabel("줄이기")
+            Button { setZoomLevel(1) } label: {
+                Text("\(Int((scale * 100).rounded()))%").font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .frame(minWidth: 40).frame(height: 26).contentShape(Rectangle())
+            }
+            .keyboardShortcut("0", modifiers: .command)
+            .help("창에 맞추기 (⌘0)")
+            Button { setZoomLevel(userZoom + 0.1) } label: {
+                Image(systemName: "plus").font(.system(size: 11, weight: .semibold)).frame(width: 30, height: 26).contentShape(Rectangle())
+            }
+            .keyboardShortcut("=", modifiers: .command)
+            .disabled(userZoom >= Self.zoomRange.upperBound)
+            .help("키우기 (⌘+)")
+            .accessibilityLabel("키우기")
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(fg.opacity(0.8))
+        .padding(.horizontal, 3)
+        .modifier(Floating(dark: dark, fill: cardC, light: lightShade, shade: darkShade))
     }
 
     private func nodeAt(_ p: CGPoint, size: CGSize) -> String? {
         let L = layout(size)
-        for (a, c) in L.app where abs(p.x - c.x) <= L.appSize.width / 2 && abs(p.y - c.y) <= L.appSize.height / 2 { return "a:" + a }
-        for (i, c) in L.exit where abs(p.x - c.x) <= L.nodeSize.width / 2 && abs(p.y - c.y) <= L.nodeSize.height / 2 { return "x:" + i }
+        for (a, c) in L.app where L.appRect(c).contains(p) { return "a:" + a }
+        for (i, c) in L.exit where L.nodeRect(c).contains(p) { return "x:" + i }
         return nil
     }
 
@@ -1400,109 +1879,77 @@ struct RoutesWindow: View {
     private func exitColor(_ e: ExitInfo?) -> Color { e.map { Color.exit($0.name, dark: dark) } ?? muted }
     private var blockC: Color { Color.exit("block", dark: dark) }
 
-    private func dimmed(rule: String?, iface: String?) -> Bool {
-        if let f = focusRule, f != rule { return true }
-        if let f = focusExit, f != iface { return true }
-        return false
-    }
-    /// 선: 클릭 강조 또는 마우스 올린 경로 밖이면 흐리게
-    private func lineDim(app: String?, rule: String?, iface: String?) -> Bool {
-        dimmed(rule: rule, iface: iface) || (hoverPath.map { !$0.matches(app: app, rule: rule, iface: iface) } ?? false)
-    }
-    private func lineHot(app: String?, rule: String?, iface: String?) -> Bool {
-        hoverPath?.matches(app: app, rule: rule, iface: iface) ?? false
-    }
-
-    /// 뒤 층 (매 프레임): 장면을 한 걸음 움직이고 전선을 그린다
+    /// 뒤 층 (매 프레임): 장면을 한 걸음 움직이고 선을 그린다
     private func drawBack(_ ctx: inout GraphicsContext, size: CGSize, now: Date) {
         let L = animatedLayout(size, now: now)
-        stream.scene.easing = false
         let scene = stream.scene
-        scene.step(now: now) { endpoints($0, L) }
-        // 전선: 규칙 → 지금 고른 출구. 출구가 바뀌었으면 옛 자리에서 새 자리로 휘어 옮겨 간다
-        func endFor(_ key: String) -> CGPoint? {
-            if key == "block" { return CGPoint(x: L.wall.x - L.nodeSize.width / 2, y: L.wall.y) }
-            return L.exit[key].map { CGPoint(x: $0.x - L.nodeSize.width / 2, y: $0.y) }
+        scene.easing = false
+        scene.step(now: now) { _ in nil }
+        let groups = diagramGroups
+        let fs = activeFocus.map { focusSets($0, groups: groups) }
+        let hovering = hoverPath != nil
+        func state(_ set: Set<String>?, _ k: String) -> (dim: Bool, hot: Bool) {
+            guard let set else { return (false, false) }
+            let c = set.contains(k)
+            return (!c, c && hovering)
         }
-        func colorFor(_ key: String) -> Color { key == "block" ? blockC : exitColor(exits.first { $0.iface == key }) }
-        for r in rules {
-            guard let rp = L.rule[r.id] else { continue }
-            let h = scene.heat["r:\(r.id)"] ?? 0
-            let from = CGPoint(x: rp.x + L.ruleSize.width / 2, y: rp.y)
-            let key = targetKey(r)
-            let dim = lineDim(app: nil, rule: r.id, iface: key == "none" ? nil : key)
-            let hot = lineHot(app: nil, rule: r.id, iface: key)
-            let stub = CGPoint(x: from.x + 36, y: from.y)       // 적용 안 함: 짧은 그루터기
-            var end = endFor(key) ?? stub
-            var col = key == "none" ? muted : colorFor(key)
-            if let mo = scene.morphs[r.id] {
-                let t = min(1, now.timeIntervalSince(mo.t0) / RouteScene.morphDuration)
-                let e = t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2       // easeInOut
-                let a = endFor(mo.from) ?? stub
-                end = CGPoint(x: a.x + (end.x - a.x) * e, y: a.y + (end.y - a.y) * e)
-                // 옛 전선이 흐려지며 남는다
-                ctx.stroke(wirePath(from, a), with: .color(colorFor(mo.from).opacity(0.35 * (1 - t))), style: StrokeStyle(lineWidth: 1.4, dash: [4, 4]))
-                col = col.opacity(0.4 + 0.6 * t)
-                ctx.stroke(wirePath(from, end), with: .color(col.opacity(0.9)), lineWidth: 2.4)
-                continue
-            }
-            if key == "none" {
-                ctx.stroke(wirePath(from, stub), with: .color(muted.opacity(0.2)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                continue
-            }
-            let fd = fade("ld:re:\(r.id)", dim), fh = fade("lh:re:\(r.id)", hot)
-            if key == "block" {
-                // 막힌 연결은 오간 양이 없으니 시도할 때마다 잠깐 진해진다
-                let op = lerp(lerp(0.16 + h * 0.5, 0.9, fh), 0.06, fd)
-                strokeLine(&ctx, wirePath(from, end), color: col, opacity: op, width: 1.2 + min(2, h * 1.5) + CGFloat(fh))
-            } else {
-                let v = scene.smooth("re:\(r.id)|\(key)", norm(stream.recent("re:\(r.id)|\(key)")))
-                let live = scene.smooth("rl:\(r.id)", stream.liveCount { $0.slot == r.id && !$0.blocked } > 0 ? 1 : 0)
-                let op = lerp(lerp(0.16 + live * 0.34 + v * 0.4, 0.95, fh), 0.06, fd)
-                strokeLine(&ctx, wirePath(from, end), color: col, opacity: op, width: 1.2 + v * 4 + CGFloat(fh))
-            }
+        // 막는 규칙의 목적지: 막음 → 줄. 늘 옅은 점선, 막을 때마다 잠깐 진해진다
+        var blockRows = Set<String>()
+        for g in groups where g.rule?.decision == "block" { for r in g.rows { blockRows.insert(r.key) } }
+        for k in scene.heat.keys where k.hasPrefix("wb:") { blockRows.insert(String(k.dropFirst(3))) }
+        for row in blockRows.sorted() {
+            guard let a = L.exitRight("block"), let b = L.rowLeft(row) else { continue }
+            let h = scene.heat["wb:" + row] ?? 0
+            let st = state(fs?.exitRow, row + "|block")
+            let fd = fade("ld:wb:" + row, st.dim), fh = fade("lh:wb:" + row, st.hot)
+            strokeLine(&ctx, wirePath(a, b), color: blockC, opacity: lerp(lerp(0.22 + h * 0.45, 0.9, fh), 0.05, fd),
+                       width: 1.1 + min(1.5, CGFloat(h)) + CGFloat(fh) * 0.8, dash: [4, 4])
         }
-        // 전선: 규칙 밖 칸 → 실제로 쓴 출구 (평소 경로). 옅게 늘 그리고, 지나갈 때 밝아진다. 점선
-        for key in visibleGroups {
-            guard let op = L.rule[key] else { continue }
-            let from = CGPoint(x: op.x + L.ruleSize.width / 2, y: op.y)
-            for i in (scene.groupExits[key] ?? []).sorted() {
-                guard let ep = L.exit[i] else { continue }
-                let v = scene.heat["o:\(key)|\(i)"] ?? 0
-                let c = exitColor(exits.first { $0.iface == i })
-                ctx.stroke(wirePath(from, CGPoint(x: ep.x - L.nodeSize.width / 2, y: ep.y)),
-                           with: .color(c.opacity(dimmed(rule: key, iface: i) ? 0.04 : 0.12 + v * 0.35)),
-                           style: StrokeStyle(lineWidth: 1 + min(3, v * 2), dash: [5, 3]))
+        // 앱 → 막음: 막힌 시도마다 잠깐
+        for (k, h) in scene.heat where k.hasPrefix("ab:") {
+            let app = String(k.dropFirst(3))
+            guard let a = L.appRight(app), let b = L.exitLeft("block") else { continue }
+            let st = state(fs?.appExit, app + "|block")
+            let fd = fade("ld:ab:" + app, st.dim), fh = fade("lh:ab:" + app, st.hot)
+            strokeLine(&ctx, wirePath(a, b), color: blockC, opacity: lerp(lerp(0.15 + h * 0.5, 0.9, fh), 0.04, fd),
+                       width: 1.1 + min(1.5, CGFloat(h)) + CGFloat(fh) * 0.8, dash: [4, 4])
+        }
+        // 열린 연결: 앱 → 출구, 출구 → 목적지 줄 (같은 쌍은 선 하나). 생길 때 그려지고, 오가면 굵어지고, 닫히면 흐려진다
+        struct Seg { var live = 0; var opened = Date.distantFuture; var closed = Date.distantPast }
+        var ax: [String: Seg] = [:], wx: [String: Seg] = [:]
+        for f in scene.flows.values {
+            let o = scene.bundleOpened[f.bundle] ?? f.opened
+            for (isAX, key) in [(true, f.app + "|" + f.iface), (false, f.row + "|" + f.iface)] {
+                var sg = (isAX ? ax[key] : wx[key]) ?? Seg()
+                if let c = f.closedAt { sg.closed = max(sg.closed, c) } else { sg.live += 1 }
+                sg.opened = min(sg.opened, o)
+                if isAX { ax[key] = sg } else { wx[key] = sg }
             }
         }
-        // 길: 수립된 연결마다 (같은 앱·칸·출구는 하나). 생길 때 그려지고, 패킷이 지나가면 밝아지고, 닫히면 흐려진다
-        for (b, fs) in scene.bundles {
-            guard let f0 = fs.first, let pts = bundlePoints(app: f0.app, slot: f0.slot, iface: f0.iface, L) else { continue }
-            let live = fs.filter { $0.closedAt == nil }
-            // 생길 때: 감속하며 그려지고 함께 짙어진다. 닫힐 때: 서서히 흐려진다
+        func drawSeg(_ path: Path, _ sg: Seg, meter: String, iface: String, st: (dim: Bool, hot: Bool)) {
             var alpha = 1.0
-            if live.isEmpty, let last = fs.compactMap(\.closedAt).max() { alpha = 1 - easeOut(now.timeIntervalSince(last) / RouteScene.closeFade) }
-            let grow = easeOut(now.timeIntervalSince(scene.bundleOpened[b] ?? .distantPast) / RouteScene.openDuration)
+            if sg.live == 0 { alpha = 1 - easeOut(now.timeIntervalSince(sg.closed) / RouteScene.closeFade) }
+            let grow = easeOut(now.timeIntervalSince(sg.opened) / RouteScene.openDuration)
             alpha *= 0.3 + 0.7 * grow
-            let v = scene.smooth("b:\(b)", norm(stream.recent("b:\(b)")))
-            let col = exitColor(exits.first { $0.iface == f0.iface })
-            let fd = fade("ld:b:\(b)", lineDim(app: f0.app, rule: f0.slot, iface: f0.iface))
-            let fh = fade("lh:b:\(b)", lineHot(app: f0.app, rule: f0.slot, iface: f0.iface))
-            let path = bundlePath(pts).trimmedPath(from: 0, to: grow)
-            strokeLine(&ctx, path, color: col, opacity: lerp(lerp((live.isEmpty ? 0.3 : 0.6) + v * 0.3, 1, fh), 0.07, fd) * alpha,
-                       width: 1.4 + v * 4 + CGFloat(fh) * 1.2, dash: f0.ev.outside == true ? [6, 3] : [])
+            let v = scene.smooth(meter, norm(stream.recent(meter)))
+            let fd = fade("ld:" + meter, st.dim), fh = fade("lh:" + meter, st.hot)
+            let op = lerp(lerp((sg.live == 0 ? 0.3 : 0.6) + v * 0.3, 1, fh), 0.07, fd) * alpha
+            strokeLine(&ctx, path.trimmedPath(from: 0, to: grow), color: exitColor(exits.first { $0.iface == iface }),
+                       opacity: op, width: 1.4 + CGFloat(v) * 4 + CGFloat(fh) * 1.2)
         }
-        // 전선: 앱 → 규칙 (열린 길이 없는 것만: 막힌 시도나 방금 닫힌 연결)
-        let openPairs = Set(scene.bundles.keys.map { $0.split(separator: "|").prefix(2).joined(separator: "|") })
-        for (k, v) in scene.heat where k.hasPrefix("a:") {
-            let parts = k.dropFirst(2).split(separator: "|", maxSplits: 1).map(String.init)
-            guard parts.count == 2, !openPairs.contains("\(parts[0])|\(parts[1])"), let ap = L.app[parts[0]], let rp = L.rule[parts[1]] else { continue }
-            let from = CGPoint(x: ap.x + L.appSize.width / 2, y: ap.y), to = CGPoint(x: rp.x - L.ruleSize.width / 2, y: rp.y)
-            let fd = fade("ld:a:\(k)", lineDim(app: parts[0], rule: parts[1], iface: nil))
-            strokeLine(&ctx, wirePath(from, to), color: fg, opacity: lerp(0.05 + v * 0.3, 0.03, fd), width: 1 + v * 1.5)
+        for (k, sg) in ax {
+            guard let i = k.lastIndex(of: "|") else { continue }
+            let app = String(k[..<i]), iface = String(k[k.index(after: i)...])
+            guard let a = L.appRight(app), let b = L.exitLeft(iface) else { continue }
+            drawSeg(wirePath(a, b), sg, meter: "ax:" + k, iface: iface, st: state(fs?.appExit, k))
         }
-        drawPulses(&ctx, L, now: now, rings: false)
-
+        for (k, sg) in wx {
+            guard let i = k.lastIndex(of: "|") else { continue }
+            let row = String(k[..<i]), iface = String(k[k.index(after: i)...])
+            guard let a = L.exitRight(iface), let b = L.rowLeft(row) else { continue }
+            drawSeg(wirePath(a, b), sg, meter: "wx:" + k, iface: iface, st: state(fs?.exitRow, k))
+        }
+        drawPulses(&ctx, L, now: now, rings: false, focus: fs)
     }
 
     // MARK: 칸 디자인 토큰
@@ -1626,118 +2073,164 @@ struct RoutesWindow: View {
         ctx.stroke(path, with: .color(color.opacity(opacity)), style: StrokeStyle(lineWidth: width, lineCap: .round, dash: dash))
     }
 
+    /// 규칙이 보내는 곳 (묶음 오른쪽 위에 적는다)
+    private func routeText(_ r: RuleStatus) -> (text: String, color: Color, dot: Bool) {
+        switch r.decision {
+        case "route":
+            let col = exitColor(exits.first { $0.iface == r.chosenIface })
+            let chosen = r.chosenExit.map(Exits.label) ?? exitName(r.chosenIface ?? "")
+            if r.exits.count > 1, let i = r.exits.firstIndex(of: r.chosenExit ?? "") { return ("\(r.exitsText) · \(i + 1)순위", col, true) }
+            return (chosen, col, true)
+        case "block": return (r.exits.isEmpty ? "막기" : "출구 없음 · 막는 중", blockC, true)
+        case "skip": return ("쉼 · " + (r.when.flatMap { try? Condition.parse($0) }.map(\.short) ?? "조건 안 맞음"), muted, false)
+        case "next": return ("쉼 · 출구 없어 다음 규칙으로", muted, false)
+        case "system": return ("쉼 · 출구 없어 평소 경로로", muted, false)
+        default: return (r.decision, muted, false)
+        }
+    }
+
+    /// 규칙 묶음: 희미한 점선 테두리, 위 테두리에 ─ 번호 이름 ──── ● 출구 ─ 처럼 글자가 걸친다.
+    /// 글자 뒤에 바탕을 깔지 않고 테두리를 글자 자리만큼 끊는다 (점 무늬가 그대로 비치게)
+    private func drawGroupFrame(_ c: inout GraphicsContext, _ g: DiagramGroup, _ gr: CGRect) {
+        var left: Text, right: Text
+        if let r = g.rule {
+            let pos = (m.status?.rules.firstIndex { $0.id == r.id } ?? 0) + 1
+            left = Text("\(pos)  ").font(.system(size: 10.5, weight: .semibold).monospacedDigit()).foregroundColor(muted)
+                + Text(TextFit.fit(r.title, 11.5, .semibold, false, gr.width * 0.45, .tail)).font(.system(size: 11.5, weight: .semibold)).foregroundColor(fg.opacity(0.78))
+            let rt = routeText(r)
+            right = (rt.dot ? Text("● ").font(.system(size: 8)).foregroundColor(rt.color) : Text(""))
+                + Text(TextFit.fit(rt.text, 10.5, .medium, false, gr.width * 0.42, .tail)).font(.system(size: 10.5, weight: .medium)).foregroundColor(rt.color)
+        } else {
+            left = Text(Image(systemName: "questionmark.circle")).font(.system(size: 10.5)).foregroundColor(muted)
+                + Text("  규칙 없음").font(.system(size: 11.5, weight: .semibold)).foregroundColor(fg.opacity(0.78))
+            right = Text("평소 경로").font(.system(size: 10.5, weight: .medium)).foregroundColor(muted)
+        }
+        let lt = c.resolve(left), rt = c.resolve(right)
+        let lw = lt.measure(in: CGSize(width: gr.width, height: 30)).width, rw = rt.measure(in: CGSize(width: gr.width, height: 30)).width
+        let lx = gr.minX + 14, rx = gr.maxX - 14
+        var b = c
+        var clip = Path(gr.insetBy(dx: -4, dy: -4))
+        clip.addRect(CGRect(x: lx - 6, y: gr.minY - 3, width: lw + 12, height: 6))
+        clip.addRect(CGRect(x: rx - rw - 6, y: gr.minY - 3, width: rw + 12, height: 6))
+        b.clip(to: clip, style: FillStyle(eoFill: true))
+        b.stroke(Path(roundedRect: gr, cornerRadius: 12, style: .continuous), with: .color(muted.opacity(dark ? 0.34 : 0.4)),
+                 style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        c.draw(lt, at: CGPoint(x: lx, y: gr.minY), anchor: .leading)
+        c.draw(rt, at: CGPoint(x: rx, y: gr.minY), anchor: .trailing)
+    }
+
     /// 가운데 층 (상태가 바뀔 때만): 칸과 글자. 매 프레임 글자를 다시 그리지 않아 CPU 를 아낀다
     private func drawNodes(_ ctx: inout GraphicsContext, size: CGSize, now: Date = Date()) {
         let L = animatedLayout(size, now: now)
         let fit = TextFit.fit
         let scene = stream.scene
+        let groups = diagramGroups
+        let fs = activeFocus.map { focusSets($0, groups: groups) }
+        scene.nodeFading = false
         func label(_ s: String, _ p: CGPoint, _ c: Color, _ font: Font, anchor: UnitPoint = .center) {
             ctx.draw(Text(s).font(font).foregroundColor(c), at: p, anchor: anchor)
         }
-        let onPath = hoverPath.map(focusNodes)
-        scene.nodeFading = false
-        /// 마우스 올린 경로 밖의 칸은 흐리게
-        func off(_ key: String) -> Bool { onPath.map { !$0.contains(key) } ?? false }
+        /// 강조한 경로 밖의 칸은 흐리게
+        func off(_ key: String) -> Bool { fs.map { !$0.nodes.contains(key) } ?? false }
         /// 흐림 정도 0…1 을 부드럽게 (바뀌는 동안 칸 층을 매 프레임 다시 그린다)
-        func dimAmt(_ key: String, _ on: Bool) -> Double {
+        func dimAmt(_ key: String) -> Double {
+            let on = off(key)
             let v = fade("nd:" + key, on)
             if v != (on ? 1 : 0) { scene.nodeFading = true }
             return v
         }
-        // 칼럼 머리글: 이름 + 개수, 밑에 칸 너비만큼 짧은 선 (선이 지나는 빈 곳에는 긋지 않는다)
-        // 칸들이 가운데로 모이므로 머리글은 맨 위 칸 바로 위에 둔다
-        var tops: [CGFloat] = [L.wall.y - L.nodeSize.height / 2]
-        tops += L.app.values.map { $0.y - L.appSize.height / 2 }
-        tops += L.rule.values.map { $0.y - L.ruleSize.height / 2 }
-        tops += L.exit.values.map { $0.y - L.nodeSize.height / 2 }
-        let topY: CGFloat = max(30, tops.min() ?? 30)
+        // 칼럼 머리글: 이름 + 개수, 밑에 칸 너비만큼 짧은 선
         func header(_ title: String, _ n: Int, x: CGFloat, width: CGFloat) {
             let t = Text(title).font(.system(size: 11, weight: .semibold)).foregroundColor(fg.opacity(0.7))
                 + Text("  \(n)").font(.system(size: 11).monospacedDigit()).foregroundColor(muted)
-            ctx.draw(t, at: CGPoint(x: x - width / 2 + 2, y: topY - 24), anchor: .leading)
-            ctx.fill(Path(CGRect(x: x - width / 2, y: topY - 13, width: width, height: 1)), with: .color(lineC.opacity(dark ? 0.9 : 0.8)))
+            ctx.draw(t, at: CGPoint(x: x - width / 2 + 2, y: RouteLayout.top - 40), anchor: .leading)
+            ctx.fill(Path(CGRect(x: x - width / 2, y: RouteLayout.top - 29, width: width, height: 1)), with: .color(lineC.opacity(dark ? 0.9 : 0.8)))
         }
-        header("앱", visibleApps.count, x: L.app.values.first?.x ?? max(76, size.width * 0.1), width: L.appSize.width)
-        header("규칙", rules.count + visibleGroups.count, x: size.width * 0.47, width: L.ruleSize.width)
+        header("앱", visibleApps.count, x: 22 + L.appSize.width / 2, width: L.appSize.width)
         header("출구", visibleExits.count, x: L.wall.x, width: L.nodeSize.width)
+        if let any = L.group.values.first {
+            header("목적지 · 규칙별로 묶음", groups.reduce(0) { $0 + $1.rows.filter { !$0.more }.count }, x: any.midX, width: any.width)
+        }
 
-        // 규칙 밖 칸: 목적지 도메인(없으면 IP)마다 하나. 규칙에 없는 연결이 평소 경로로 나간다
-        for key in visibleGroups {
-            guard let p = L.rule[key] else { continue }
-            let w = L.ruleSize.width, h = L.ruleSize.height
-            let rect = CGRect(x: p.x - w / 2, y: p.y - h / 2, width: w, height: h)
+        // 오른쪽: 규칙 묶음과 목적지 줄
+        for g in groups {
+            guard let gr = L.group[g.key] else { continue }
+            let resting = g.rule.map { ["skip", "system", "next"].contains($0.decision) } ?? false
             var c = ctx
-            c.opacity = dimmed(rule: key, iface: nil) ? NodeToken.dimmed : 1
-            let n = stream.liveCount { $0.slot == key }
-            drawCard(&c, rect, shape: .outside, tint: nil, state: n > 0 ? .active : .idle, selected: focusRule == key)
-            c.draw(Text(Image(systemName: "questionmark.circle")).font(.system(size: 12)).foregroundColor(muted), at: CGPoint(x: rect.minX + 19, y: p.y))
-            let room = w - 34 - NodeToken.inset - NodeToken.meter.width - (n > 0 ? 26 : 8)
-            c.draw(Text(fit(String(key.dropFirst()), 12.5, .semibold, false, room, .middle)).font(NodeToken.title).foregroundColor(fg.opacity(0.85)),
-                   at: CGPoint(x: rect.minX + 34, y: p.y - (h >= 30 ? 6 : 0)), anchor: .leading)
-            if h >= 30 {
-                let sub = scene.groupLatest[key].flatMap { $0 == String(key.dropFirst()) ? nil : $0 } ?? "규칙 없음"
-                c.draw(Text(fit(sub, 10, .regular, false, room, .middle)).font(NodeToken.sub).foregroundColor(muted), at: CGPoint(x: rect.minX + 34, y: p.y + 8), anchor: .leading)
+            c.opacity = lerp(resting ? 0.62 : 1, NodeToken.dimmed, dimAmt("g:" + g.key))
+            drawGroupFrame(&c, g, gr)
+            let blockRule = g.rule?.decision == "block"
+            for row in g.rows {
+                guard let rect = L.rowRect(row.key) else { continue }
+                let n = stream.liveCount { $0.row == row.key && !$0.blocked }
+                var rc = c
+                rc.opacity = c.opacity * lerp(1, NodeToken.dimmed, dimAmt("w:" + row.key))
+                let st: NodeState = n > 0 ? .active : .resting
+                let tint: Color? = blockRule ? blockC : stream.dests.values.first { $0.row == row.key && !$0.blocked && !$0.live.isEmpty }
+                    .map { d in exitColor(exits.first { $0.iface == d.iface }) }
+                drawCard(&rc, rect, shape: blockRule ? .wall : .rule, tint: n > 0 || blockRule ? tint : nil, state: blockRule ? .idle : st,
+                         selected: focusRule == row.key)
+                let blocks = scene.count("w:" + row.key)
+                let cc = row.more ? nil : rowCountry(row)
+                var right = rect.maxX - NodeToken.inset
+                if !row.more && !blockRule {
+                    drawMeter(&rc, key: "w:\(row.key)", in: CGRect(x: right - NodeToken.meter.width, y: rect.midY - NodeToken.meter.height / 2,
+                                                              width: NodeToken.meter.width, height: NodeToken.meter.height))
+                    right -= NodeToken.meter.width + 6
+                }
+                let countText = blockRule || blocks > 0 && n == 0 ? (blocks > 0 ? "막힘 \(blocks)" : "") : n > 0 ? "\(n)" : ""
+                if !countText.isEmpty {
+                    let t = rc.resolve(Text(countText).font(NodeToken.digits).foregroundColor(blockRule || n == 0 ? blockC.opacity(0.9) : muted))
+                    rc.draw(t, at: CGPoint(x: right, y: rect.midY), anchor: .trailing)
+                    right -= t.measure(in: CGSize(width: 80, height: 20)).width + 8
+                }
+                if let cc {
+                    let t = rc.resolve(Text(cc).font(.system(size: 9, weight: .semibold).monospaced()).foregroundColor(muted))
+                    let sz = t.measure(in: CGSize(width: 40, height: 20))
+                    let box = CGRect(x: right - sz.width - 8, y: rect.midY - sz.height / 2 - 2, width: sz.width + 8, height: sz.height + 4)
+                    rc.stroke(Path(roundedRect: box, cornerRadius: 3.5), with: .color(muted.opacity(0.4)), lineWidth: 0.8)
+                    rc.draw(t, at: CGPoint(x: box.midX, y: box.midY))
+                    right = box.minX - 8
+                }
+                let room = right - (rect.minX + 12)
+                let titleC: Color = blockRule ? blockC : row.more || n == 0 ? fg.opacity(0.6) : fg.opacity(0.9)
+                rc.draw(Text(fit(row.title, 12, .semibold, false, room, .middle)).font(.system(size: 12, weight: .semibold)).foregroundColor(titleC),
+                        at: CGPoint(x: rect.minX + 12, y: rect.midY - 7), anchor: .leading)
+                rc.draw(Text(fit(row.sub, 10, .regular, false, room, .middle)).font(NodeToken.sub).foregroundColor(muted),
+                        at: CGPoint(x: rect.minX + 12, y: rect.midY + 8), anchor: .leading)
+                drawPort(&rc, CGPoint(x: rect.minX, y: rect.midY), color: blockRule ? blockC.opacity(0.8) : tint ?? lineC,
+                         filled: fs != nil && !off("w:" + row.key) && (n > 0 || blockRule))
             }
-            drawTrail(&c, rect, meter: "r:\(key)", count: n)
-            drawPort(&c, CGPoint(x: rect.minX, y: p.y), color: lineC)
-            drawPort(&c, CGPoint(x: rect.maxX, y: p.y), color: lineC)
         }
 
-        // 길 양 끝의 포트: 앱 쪽은 출발 포트(여럿이면 개수), 출구 쪽은 목적지 포트.
-        // 한 앱에서 여러 규칙으로, 여러 규칙에서 한 출구로 길이 갈라지면 끝점이 같으므로 끝점마다 모아 한 번만 쓴다.
-        var appEnds: [String: (p: CGPoint, flows: [RouteScene.Flow])] = [:]
-        var exitEnds: [String: (p: CGPoint, flows: [RouteScene.Flow])] = [:]
-        for (_, fs) in scene.bundles {
-            let live = fs.filter { $0.closedAt == nil }
-            guard let f0 = live.first, let pts = bundlePoints(app: f0.app, slot: f0.slot, iface: f0.iface, L) else { continue }
-            if dimmed(rule: f0.slot, iface: f0.iface) { continue }
-            appEnds[f0.app, default: (pts.0, [])].flows += live
-            exitEnds[f0.iface, default: (pts.3, [])].flows += live
-        }
-        // 포트는 선 위를 어지럽히므로 마우스를 올린 칸 것만 쓴다
-        let portFont = Font.system(size: 10, weight: .medium).monospacedDigit()
-        for (app, end) in appEnds where hoverNode == "a:" + app {
-            let sports = Set(end.flows.map(\.ev.sport))
-            let left = sports.count == 1 ? ":\(sports.first!)" : "\(end.flows.count)개 연결"
-            ctx.draw(Text(left).font(portFont).foregroundColor(muted), at: CGPoint(x: end.p.x + 6, y: end.p.y - 8), anchor: .leading)
-        }
-        for (iface, end) in exitEnds where hoverNode == "x:" + iface {
-            let ds = Array(Set(end.flows.map(\.ev.dport))).sorted()
-            var text = ds.prefix(3).map { ":\($0)" }.joined(separator: " ") + (ds.count > 3 ? " +\(ds.count - 3)" : "")
-            let protos = Set(end.flows.map(\.ev.proto)).sorted()
-            text += " " + protos.joined(separator: "/")
-            ctx.draw(Text(text).font(portFont).foregroundColor(exitColor(exits.first { $0.iface == iface }).opacity(0.85)),
-                     at: CGPoint(x: end.p.x - 6, y: end.p.y - 9), anchor: .trailing)
-        }
-
-        // 앱 칸 (출발): 알약
+        // 왼쪽: 앱 칸 (출발, 알약)
         for a in visibleApps {
             guard let p = L.app[a] else { continue }
-            let rect = CGRect(x: p.x - L.appSize.width / 2, y: p.y - L.appSize.height / 2, width: L.appSize.width, height: L.appSize.height)
+            let rect = L.appRect(p)
             let live = stream.liveCount { $0.app == a && !$0.blocked }
             var selected = false
             if case .app(let z)? = zoom { selected = z == a }
-            var ctx = ctx
+            var c = ctx
             // 나타날 때: 왼쪽에서 살짝 미끄러지며 짙어진다
             let ap = scene.appeared["a:" + a].map { easeOut(now.timeIntervalSince($0) / RouteScene.appearDuration) } ?? 1
-            ctx.opacity = (1 - 0.6 * dimAmt("a:" + a, off("a:" + a))) * ap
-            ctx.translateBy(x: -10 * (1 - ap), y: 0)
-            drawCard(&ctx, rect, shape: .app, tint: nil, state: live > 0 ? .active : .idle, selected: selected)
+            c.opacity = (1 - 0.6 * dimAmt("a:" + a)) * ap
+            c.translateBy(x: -10 * (1 - ap), y: 0)
+            drawCard(&c, rect, shape: .app, tint: nil, state: live > 0 ? .active : .idle, selected: selected || quickApp == a)
             let room = rect.width - 32 - 10 - NodeToken.meter.width - 6
             if let icon = scene.icons[a] {
-                ctx.draw(Image(nsImage: icon), in: CGRect(x: rect.minX + 9, y: p.y - 9, width: 18, height: 18))
-                label(fit(a, 12, .medium, false, room, .tail), CGPoint(x: rect.minX + 32, y: p.y), fg, NodeToken.appTitle, anchor: .leading)
+                c.draw(Image(nsImage: icon), in: CGRect(x: rect.minX + 9, y: p.y - 9, width: 18, height: 18))
+                c.draw(Text(fit(a, 12, .medium, false, room, .tail)).font(NodeToken.appTitle).foregroundColor(fg), at: CGPoint(x: rect.minX + 32, y: p.y), anchor: .leading)
             } else {
-                label(fit(a, 12, .medium, false, room + 22, .tail), CGPoint(x: rect.minX + 12, y: p.y), fg, NodeToken.appTitle, anchor: .leading)
+                c.draw(Text(fit(a, 12, .medium, false, room + 22, .tail)).font(NodeToken.appTitle).foregroundColor(fg), at: CGPoint(x: rect.minX + 12, y: p.y), anchor: .leading)
             }
-            drawTrail(&ctx, rect, meter: "a:\(a)", count: 0, inset: 10)
+            drawTrail(&c, rect, meter: "a:\(a)", count: 0, inset: 10)
             let appC = stream.dests.values.first { $0.app == a && !$0.blocked && !$0.live.isEmpty }.map { d in exitColor(exits.first { $0.iface == d.iface }) }
-            drawPort(&ctx, CGPoint(x: rect.maxX, y: p.y), color: appC ?? (live > 0 ? fg.opacity(0.4) : lineC), filled: onPath != nil && !off("a:" + a))
+            drawPort(&c, CGPoint(x: rect.maxX, y: p.y), color: appC ?? (live > 0 ? fg.opacity(0.4) : lineC), filled: fs != nil && !off("a:" + a))
         }
-        // 밀려난 앱 칸: 그 자리에서 흐려지며 사라진다
+        // 빠진 앱 칸: 그 자리에서 흐려지며 사라진다
         for (a, lv) in scene.leaving {
             let k = easeOut(now.timeIntervalSince(lv.t0) / RouteScene.leaveDuration)
-            let rect = CGRect(x: lv.at.x - L.appSize.width / 2, y: lv.at.y - L.appSize.height / 2, width: L.appSize.width, height: L.appSize.height)
+            let rect = L.appRect(lv.at)
             var c = ctx
             c.opacity = 1 - k
             drawCard(&c, rect, shape: .app, tint: nil, state: .idle, selected: false)
@@ -1745,53 +2238,18 @@ struct RoutesWindow: View {
             c.draw(Text(a).font(NodeToken.appTitle).foregroundColor(fg), at: CGPoint(x: rect.minX + 32, y: lv.at.y), anchor: .leading)
         }
         if visibleApps.isEmpty && !showsEmptyCard {
-            label("연결을 기다리는 중", CGPoint(x: size.width * 0.11, y: size.height / 2), muted, .caption)
+            label("연결을 기다리는 중", CGPoint(x: 22 + L.appSize.width / 2, y: RouteLayout.top + 30), muted, .caption)
         }
 
-        // 규칙 칸 (판단): 번호 동그라미의 색이 지금 보내는 곳
-        for (i, r) in rules.enumerated() {
-            guard let p = L.rule[r.id] else { continue }
-            let w = L.ruleSize.width, h = L.ruleSize.height
-            let rect = CGRect(x: p.x - w / 2, y: p.y - h / 2, width: w, height: h)
-            let resting = r.decision == "skip" || r.decision == "system" || r.decision == "next"
-            let routeC = exitColor(exits.first { $0.iface == r.chosenIface })
-            let accent: Color? = r.decision == "route" ? routeC : r.decision == "block" ? blockC : nil
-            let n = stream.liveCount { $0.slot == r.id && !$0.blocked }
-            var c = ctx
-            c.opacity = lerp(resting ? NodeToken.resting : 1, NodeToken.dimmed, dimAmt("r:" + r.id, dimmed(rule: r.id, iface: r.chosenIface ?? "block") || off("r:" + r.id)))
-            drawCard(&c, rect, shape: .rule, tint: nil, state: resting ? .resting : n > 0 ? .active : .idle, selected: focusRule == r.id)
-            // 번호 동그라미가 지금 보내는 곳의 색을 띤다 (출구 색 = 보내는 중, 산호색 = 막는 중, 회색 = 쉼)
-            let pos = (m.status?.rules.firstIndex { $0.id == r.id } ?? i) + 1
-            let bc = CGPoint(x: rect.minX + 19, y: p.y)
-            c.fill(Path(ellipseIn: CGRect(x: bc.x - 9, y: bc.y - 9, width: 18, height: 18)), with: .color((accent ?? fg).opacity(accent == nil ? 0.07 : 0.18)))
-            c.draw(Text("\(pos)").font(.system(size: 10, weight: .semibold).monospacedDigit()).foregroundColor(accent ?? muted), at: bc)
-            let room = w - 34 - NodeToken.inset - NodeToken.meter.width - (n > 0 ? 26 : 8)
-            c.draw(Text(fit(r.title, 12.5, .semibold, false, room, .tail)).font(NodeToken.title).foregroundColor(fg),
-                   at: CGPoint(x: rect.minX + 34, y: p.y - (h >= 30 ? 6 : 0)), anchor: .leading)
-            if h >= 30 {
-                // 쉬는 규칙은 대상 대신 쉬는 까닭을 쓴다 ("쉼 · 01:00–05:00", "쉼 · 다음 규칙으로")
-                let why: String? = !resting ? nil : r.decision == "skip"
-                    ? "쉼 · " + (r.when.flatMap { try? Condition.parse($0) }.map(\.short) ?? "조건 안 맞음")
-                    : r.decision == "next" ? "쉼 · 출구 없어 다음 규칙으로" : "쉼 · 출구 없어 평소 경로로"
-                c.draw(Text(fit(why ?? r.targets.map(\.target).joined(separator: ", "), 10, .regular, false, room, .tail)).font(NodeToken.sub).foregroundColor(muted),
-                       at: CGPoint(x: rect.minX + 34, y: p.y + 8), anchor: .leading)
-            }
-            drawTrail(&c, rect, meter: r.decision == "block" ? nil : "r:\(r.id)", count: n)
-            let hotRule = onPath != nil && !off("r:" + r.id)
-            drawPort(&c, CGPoint(x: rect.minX, y: p.y), color: accent ?? lineC, filled: hotRule && accent != nil)
-            drawPort(&c, CGPoint(x: rect.maxX, y: p.y), color: accent?.opacity(0.8) ?? lineC, filled: hotRule && accent != nil)
-        }
-
-        // 출구 칸 (도착): 출구 색 바탕
+        // 가운데: 출구 칸 (출구 색 바탕, 양옆에 연결점)
         for e in visibleExits {
             guard let p = L.exit[e.iface] else { continue }
-            let w = L.nodeSize.width, h = L.nodeSize.height
-            let rect = CGRect(x: p.x - w / 2, y: p.y - h / 2, width: w, height: h)
+            let rect = L.nodeRect(p)
             let col = exitColor(e)
             let down = e.up && e.healthy == false
             let n = stream.liveCount { $0.iface == e.iface && !$0.blocked }
             var c = ctx
-            c.opacity = lerp(1, NodeToken.dimmed, dimAmt("x:" + e.iface, dimmed(rule: nil, iface: e.iface) || off("x:" + e.iface)))
+            c.opacity = lerp(1, NodeToken.dimmed, dimAmt("x:" + e.iface))
             drawCard(&c, rect, shape: .exit, tint: e.up ? col : nil, state: !e.up ? .absent : down ? .warn : n > 0 ? .active : .idle,
                      selected: focusExit == e.iface)
             c.draw(Text(Image(systemName: Exits.symbol(e.name))).font(.system(size: 13, weight: .medium)).foregroundColor(down ? warnC : e.up ? col : muted),
@@ -1804,93 +2262,48 @@ struct RoutesWindow: View {
             c.draw(down ? (Text(Image(systemName: "exclamationmark.triangle.fill")).font(.system(size: 9)) + Text(" ") + sub).foregroundColor(warnC)
                         : sub.foregroundColor(muted), at: CGPoint(x: tx, y: p.y + 9), anchor: .leading)
             drawTrail(&c, rect, meter: "x:\(e.iface)", count: n)
-            drawPort(&c, CGPoint(x: rect.minX, y: p.y), color: e.up ? col.opacity(0.8) : lineC, filled: onPath != nil && !off("x:" + e.iface) && e.up)
+            let hot = fs != nil && !off("x:" + e.iface) && e.up
+            drawPort(&c, CGPoint(x: rect.minX, y: p.y), color: e.up ? col.opacity(0.8) : lineC, filled: hot)
+            drawPort(&c, CGPoint(x: rect.maxX, y: p.y), color: e.up ? col.opacity(0.8) : lineC, filled: hot)
         }
-        // 막음 (도착): 출구와 같은 모양, 산호색 점선. 숫자는 최근 60초 동안 막은 횟수
+        // 막음: 출구와 같은 자리, 산호색 점선. 숫자는 최근 60초 동안 막은 횟수
         do {
-            let w = L.nodeSize.width, h = L.nodeSize.height, p = L.wall
-            let rect = CGRect(x: p.x - w / 2, y: p.y - h / 2, width: w, height: h)
+            let p = L.wall
+            let rect = L.nodeRect(p)
             var c = ctx
-            c.opacity = lerp(1, NodeToken.dimmed, dimAmt("x:block", dimmed(rule: nil, iface: "block") || off("x:block")))
+            c.opacity = lerp(1, NodeToken.dimmed, dimAmt("x:block"))
             drawCard(&c, rect, shape: .wall, tint: blockC, state: .idle, selected: focusExit == "block")
             c.draw(Text(Image(systemName: "nosign")).font(.system(size: 13, weight: .medium)).foregroundColor(blockC), at: CGPoint(x: rect.minX + 19, y: p.y))
             c.draw(Text("막음").font(NodeToken.title).foregroundColor(fg), at: CGPoint(x: rect.minX + 36, y: p.y - 7), anchor: .leading)
             c.draw(Text("최근 60초").font(NodeToken.sub).foregroundColor(muted), at: CGPoint(x: rect.minX + 36, y: p.y + 9), anchor: .leading)
             drawTrail(&c, rect, meter: nil, count: scene.count("x:block"))
-            drawPort(&c, CGPoint(x: rect.minX, y: p.y), color: blockC.opacity(0.8), filled: onPath != nil && !off("x:block"))
+            let hot = fs != nil && !off("x:block")
+            drawPort(&c, CGPoint(x: rect.minX, y: p.y), color: blockC.opacity(0.8), filled: hot)
+            drawPort(&c, CGPoint(x: rect.maxX, y: p.y), color: blockC.opacity(0.8), filled: hot)
         }
     }
 
-    /// 앞 층 (매 프레임): 규칙 칸 반짝임, 캡슐, 파편
+    /// 앞 층 (매 프레임): 핑이 닿을 때 퍼지는 원, 규칙의 출구가 바뀌었을 때 잠깐 뜨는 글
     private func drawFront(_ ctx: inout GraphicsContext, size: CGSize, now: Date) {
         let L = animatedLayout(size, now: now)
-        drawPulses(&ctx, L, now: now, rings: true)
+        let fs = activeFocus.map { focusSets($0, groups: diagramGroups) }
+        drawPulses(&ctx, L, now: now, rings: true, focus: fs)
         let scene = stream.scene
-        // 출구가 바뀐 규칙 옆에 잠깐 "Wi-Fi(en0) → VPN:pass(utun4)"
+        // 출구가 바뀐 규칙: 묶음 오른쪽 위에 잠깐 "Wi-Fi(en0) → VPN:pass(utun4)"
         for (id, n) in scene.notes {
-            guard let p = L.rule[id] else { continue }
+            guard let gr = L.group[id] else { continue }
             let t = now.timeIntervalSince(n.t0)
             let a = t < 0.25 ? t / 0.25 : max(0, min(1, (RouteScene.noteDuration - t) / 0.7))
             let r = rules.first { $0.id == id }
             let col: Color = r.map { targetKey($0) == "block" ? blockC : targetKey($0) == "none" ? muted : exitColor(exits.first { $0.iface == r?.chosenIface }) } ?? fg
             let text = ctx.resolve(Text(n.text).font(.system(size: 11, weight: .semibold)).foregroundColor(col))
             let sz = text.measure(in: CGSize(width: 400, height: 30))
-            let at = CGPoint(x: p.x + L.ruleSize.width / 2 + 12, y: p.y - L.ruleSize.height / 2 - 4)
+            let box = CGRect(x: gr.maxX - sz.width - 12, y: gr.minY - sz.height - 16, width: sz.width + 12, height: sz.height + 6)
             var g = ctx
             g.opacity = a
-            g.fill(Path(roundedRect: CGRect(x: at.x - 6, y: at.y - sz.height / 2 - 3, width: sz.width + 12, height: sz.height + 6), cornerRadius: 6), with: .color(stage.opacity(0.92)))
-            g.stroke(Path(roundedRect: CGRect(x: at.x - 6, y: at.y - sz.height / 2 - 3, width: sz.width + 12, height: sz.height + 6), cornerRadius: 6), with: .color(col.opacity(0.7)), lineWidth: 1)
-            g.draw(text, at: at, anchor: .leading)
-        }
-        // 칸은 번쩍이지 않는다: 선 굵기·진하기와 칸 안의 트래픽 칸으로만 보여 준다
-        // 캡슐
-        for i in scene.caps.indices {
-            let cap = scene.caps[i]
-            if cap.dir != 0 {
-                // 패킷: 길을 따라 나가거나(앱 → 출구) 들어온다(출구 → 앱)
-                guard let pts = bundlePoints(app: cap.app, slot: cap.slot, iface: cap.ev.iface, L) else { continue }
-                let el = now.timeIntervalSince(cap.t0)
-                if el < 0 { scene.caps[i].pos = CGPoint(x: -100, y: -100); continue }   // 아직 출발 전 (차례로 보낸다)
-                let t = min(1, el / RouteScene.flowDuration)
-                let k = cap.dir > 0 ? t : 1 - t
-                let p: CGPoint
-                if k < 0.4 { p = cubic(pts.0, pts.1, k / 0.4) }
-                else if k < 0.46 { p = CGPoint(x: pts.1.x + (pts.2.x - pts.1.x) * (k - 0.4) / 0.06, y: pts.1.y) }
-                else { p = cubic(pts.2, pts.3, (k - 0.46) / 0.54) }
-                scene.caps[i].pos = p
-                let col = exitColor(exits.first { $0.iface == cap.ev.iface })
-                let dim = dimmed(rule: cap.slot, iface: cap.ev.iface)
-                var g = ctx
-                g.opacity = dim ? 0.12 : (cap.ev.outside == true ? 0.7 : 1)
-                if cap.dir > 0 {
-                    if !dim { g.fill(Path(roundedRect: CGRect(x: p.x - 12, y: p.y - 5.5, width: 24, height: 11), cornerRadius: 5.5), with: .color(col.opacity(0.22))) }
-                    g.fill(Path(roundedRect: CGRect(x: p.x - 7, y: p.y - 2.5, width: 14, height: 5), cornerRadius: 2.5), with: .color(col))
-                } else {
-                    // 들어오는 패킷: 작고 밝은 알
-                    if !dim { g.fill(Path(ellipseIn: CGRect(x: p.x - 6, y: p.y - 6, width: 12, height: 12)), with: .color(fg.opacity(0.18))) }
-                    g.fill(Path(ellipseIn: CGRect(x: p.x - 3, y: p.y - 3, width: 6, height: 6)), with: .color(fg.opacity(0.9)))
-                    g.stroke(Path(ellipseIn: CGRect(x: p.x - 3, y: p.y - 3, width: 6, height: 6)), with: .color(col), lineWidth: 1)
-                }
-                continue
-            }
-            guard let (a, r, end) = endpoints(cap, L) else { continue }
-            let k = min(1, now.timeIntervalSince(cap.t0) / RouteScene.duration)
-            let aR = CGPoint(x: a.x + L.appSize.width / 2, y: a.y)
-            let rL = CGPoint(x: r.x - L.ruleSize.width / 2, y: r.y), rR = CGPoint(x: r.x + L.ruleSize.width / 2, y: r.y)
-            let p: CGPoint
-            if k < 0.4 { p = cubic(aR, rL, k / 0.4) }
-            else if k < 0.46 { p = CGPoint(x: rL.x + (rR.x - rL.x) * (k - 0.4) / 0.06, y: r.y) }   // 규칙 칸을 가로지른다
-            else { p = cubic(rR, end, (k - 0.46) / 0.54) }
-            scene.caps[i].pos = p
-            let ex = exits.first { $0.iface == cap.ev.iface }
-            let col: Color = k < 0.43 ? (cap.ev.outside == true ? muted : fg)
-                : (cap.ev.act == "block" ? blockC : cap.ev.outside == true ? exitColor(ex).opacity(0.6) : exitColor(ex))
-            let dim = dimmed(rule: cap.slot, iface: cap.ev.act == "block" ? "block" : cap.ev.iface)
-            var g = ctx
-            g.opacity = dim ? 0.15 : (cap.replay ? 0.75 : 1)
-            if !dim { g.fill(Path(roundedRect: CGRect(x: p.x - 13, y: p.y - 6, width: 26, height: 12), cornerRadius: 6), with: .color(col.opacity(0.22))) }   // 빛
-            g.fill(Path(roundedRect: CGRect(x: p.x - 8, y: p.y - 3, width: 16, height: 6), cornerRadius: 3), with: .color(col))
-            if cap.n > 1 && !dim { ctx.draw(Text("×\(cap.n)").font(.system(size: 10, weight: .semibold, design: .monospaced)).foregroundColor(fg), at: CGPoint(x: p.x + 11, y: p.y - 9), anchor: .leading) }
+            g.fill(Path(roundedRect: box, cornerRadius: 6), with: .color(stage.opacity(0.92)))
+            g.stroke(Path(roundedRect: box, cornerRadius: 6), with: .color(col.opacity(0.7)), lineWidth: 1)
+            g.draw(text, at: CGPoint(x: box.midX, y: box.midY))
         }
         for s in scene.sparks {
             ctx.fill(Path(ellipseIn: CGRect(x: s.p.x - s.r, y: s.p.y - s.r, width: s.r * 2, height: s.r * 2)), with: .color(blockC.opacity(max(0, s.life))))
@@ -1899,35 +2312,51 @@ struct RoutesWindow: View {
 
     // MARK: 조작
 
-    /// 앱·규칙·출구 칸을 두 번 누르면 그것만 본다. 같은 칸을 다시 두 번 누르면 전체로.
-    private func doubleTap(_ p: CGPoint, size: CGSize) {
+    private enum Hit { case app(String, CGRect), exit(String, CGRect), row(DiagramRow, DiagramGroup, CGRect), group(DiagramGroup), none }
+
+    private func hitTest(_ p: CGPoint, size: CGSize) -> Hit {
         let L = layout(size)
-        func toggle(_ z: Zoom) { setZoom(zoom == z ? nil : z) }
-        if let a = L.app.first(where: { abs($0.value.x - p.x) < L.appSize.width / 2 && abs($0.value.y - p.y) < L.appSize.height / 2 }) {
-            toggle(.app(a.key)); return
+        for (a, c) in L.app where L.appRect(c).contains(p) { return .app(a, L.appRect(c)) }
+        for (x, c) in L.exit where L.nodeRect(c).contains(p) { return .exit(x, L.nodeRect(c)) }
+        if L.nodeRect(L.wall).contains(p) { return .exit("block", L.nodeRect(L.wall)) }
+        for g in diagramGroups {
+            for row in g.rows { if let r = L.rowRect(row.key), r.contains(p) { return .row(row, g, r) } }
+            if let gr = L.group[g.key], gr.insetBy(dx: 0, dy: -10).contains(p) { return .group(g) }
         }
-        if let r = L.rule.first(where: { abs($0.value.x - p.x) < L.ruleSize.width / 2 && abs($0.value.y - p.y) < L.ruleSize.height / 2 }) {
-            toggle(.rule(r.key)); return
-        }
-        if let e = L.exit.first(where: { abs($0.value.x - p.x) < L.nodeSize.width / 2 && abs($0.value.y - p.y) < L.nodeSize.height / 2 }) {
-            toggle(.exit(e.key)); return
-        }
-        if abs(L.wall.x - p.x) < L.nodeSize.width / 2 && abs(L.wall.y - p.y) < L.nodeSize.height / 2 { toggle(.exit("block")) }
+        return .none
     }
 
+    /// 두 번 누르면 그것만 본다. 같은 칸을 다시 두 번 누르면 전체로.
+    private func doubleTap(_ p: CGPoint, size: CGSize) {
+        func toggle(_ z: Zoom) { quick = nil; setZoom(zoom == z ? nil : z) }
+        switch hitTest(p, size: size) {
+        case .app(let a, _): toggle(.app(a))
+        case .exit(let x, _): toggle(.exit(x))
+        case .row(let row, _, _): if row.slot != "~+" { toggle(.rule(row.slot)) }
+        case .group(let g): if g.rule != nil { toggle(.rule(g.key)) }
+        case .none: break
+        }
+    }
+
+    /// 앱을 누르면 간 곳으로 규칙 만들기, 규칙 밖 목적지를 누르면 그 자리에서 규칙 만들기, 규칙·출구는 강조
     private func tap(_ p: CGPoint, size: CGSize) {
-        let L = layout(size)
-        if let r = L.rule.first(where: { abs($0.value.x - p.x) < L.ruleSize.width / 2 && abs($0.value.y - p.y) < L.ruleSize.height / 2 }) {
-            focusRule = focusRule == r.key ? nil : r.key; focusExit = nil; return
+        switch hitTest(p, size: size) {
+        case .app(let a, let r):
+            quick = QuickPop(kind: .app(a), anchor: r, edge: .trailing)
+        case .row(let row, let g, let r):
+            if g.rule == nil && !row.more {
+                quick = QuickPop(kind: .rule(quickSeed(row)), anchor: r, edge: .leading)
+            } else {
+                focusRule = focusRule == row.slot ? nil : row.slot; focusExit = nil
+            }
+        case .group(let g):
+            if g.rule != nil { focusRule = focusRule == g.key ? nil : g.key; focusExit = nil }
+        case .exit(let x, _):
+            focusExit = focusExit == x ? nil : x; focusRule = nil
+        case .none:
+            focusRule = nil; focusExit = nil
+            if zoom != nil || selection != nil { showAll() }       // 빈 곳을 누르면 전체로
         }
-        if let e = L.exit.first(where: { abs($0.value.x - p.x) < L.nodeSize.width / 2 && abs($0.value.y - p.y) < L.nodeSize.height / 2 }) {
-            focusExit = focusExit == e.key ? nil : e.key; focusRule = nil; return
-        }
-        if abs(L.wall.x - p.x) < L.nodeSize.width / 2 && abs(L.wall.y - p.y) < L.nodeSize.height / 2 {
-            focusExit = focusExit == "block" ? nil : "block"; focusRule = nil; return
-        }
-        focusRule = nil; focusExit = nil
-        if zoom != nil || selection != nil { showAll() }       // 빈 곳을 누르면 전체로
     }
 
     // MARK: 연결 목록 (Little Snitch 의 Connections 처럼: 앱 ▸ 목적지, 줄마다 출구와 오간 양)
@@ -2333,5 +2762,19 @@ enum TextFit {
         if cache.count > 2000 { cache.removeAll() }
         cache[key] = out
         return out
+    }
+}
+
+/// 흐름도 위에 떠 있는 판 (범례·배율 단추): 칸과 같은 바탕에 바깥 그림자 두 개와 옅은 테두리
+struct Floating: ViewModifier {
+    let dark: Bool
+    let fill: Color, light: Color, shade: Color
+    func body(content: Content) -> some View {
+        content.background(
+            Capsule().fill(fill)
+                .shadow(color: light.opacity(dark ? 0.9 : 0.95), radius: 8, x: -3, y: -3)
+                .shadow(color: shade.opacity(dark ? 1 : 0.9), radius: 10, x: 3.5, y: 5)
+        )
+        .overlay(Capsule().strokeBorder((dark ? Color.white : .black).opacity(dark ? 0.08 : 0.05)))
     }
 }

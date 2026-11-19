@@ -296,6 +296,12 @@ struct AppRulesView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 560)
+        .onReceive(AppModel.shared.$pendingSplitApp) { url in
+            // 라우팅 보기에서 "앱별 스플리팅에 추가…"로 연 앱
+            guard let url else { return }
+            AppModel.shared.pendingSplitApp = nil
+            choose(url)
+        }
         .onChange(of: selection) { _, value in
             if value == nil && newRule { return }
             draft = model.config.rules.first { $0.id == value }; newRule = false
@@ -454,6 +460,11 @@ struct AppRulesView: View {
         panel.directoryURL = URL(fileURLWithPath: "/Applications"); panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false; panel.treatsFilePackagesAsDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        choose(url)
+    }
+
+    /// 고른 앱: 이미 규칙이 있으면 그 규칙을, 없으면 새 규칙 초안을 연다
+    private func choose(_ url: URL) {
         do {
             let rule = try SplitControl.selectedApp(url)
             if let existing = model.config.rules.first(where: { $0.signingID == rule.signingID && $0.teamID == rule.teamID }) {

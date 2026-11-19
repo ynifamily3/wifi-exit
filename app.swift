@@ -249,6 +249,7 @@ final class AppModel: ObservableObject {
     @Published var config: EngineConfig?
     @Published var windowSelection: String?     // 편집 창에서 고른 것: "rule:<id>" | "profile:<이름>" | "new"
     @Published var drafts: [String: RuleDraft] = [:]   // 편집 창의 저장하지 않은 편집 (키는 windowSelection 과 같다)
+    @Published var pendingSplitApp: URL?        // 라우팅 보기의 "앱별 스플리팅에 추가…": 앱별 스플리팅 창이 이 앱으로 새 규칙을 연다
     @Published var splitEnabled = false                 // 앱별 스플리팅 프록시가 켜져 있는지 (팝업 타일)
 
     private var timer: Timer?
